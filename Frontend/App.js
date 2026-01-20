@@ -10,20 +10,46 @@ import {
 	StatusBar,
 	Animated,
 	Easing,
+	TextInput,
 } from "react-native";
 import { VideoView, useVideoPlayer } from "expo-video";
+import CommentsSection from "./CommentsSection";
 
+// Screen size used to size pages/videos for a full-screen vertical feed.
 const { height: H, width: W } = Dimensions.get("window");
-
+// Mock feed data with post metadata and comment samples.
 const FEED = [
 	{
 		id: "1",
 		username: "andrew",
-		caption: "expo-video ✅",
+		caption: "expo-video for bmr✅",
 		audio: "Original audio",
 		uri: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
 		likes: 5463066,
-		comments: 409583,
+		comments: [
+			{
+				id: "c1",
+				user: "osuFan",
+				text: "This looks smooth 🔥",
+				likes: 120,
+				createdAt: "2026-01-10T14:01:00Z",
+			},
+			{
+				id: "c2",
+				user: "devguy",
+				text: "expo-video is so nice compared to expo-av",
+				likes: 88,
+				createdAt: "2026-01-10T14:03:00Z",
+			},
+			{
+				id: "c3",
+				user: "alex",
+				text: "That like animation is clean",
+				likes: 42,
+				createdAt: "2026-01-10T14:05:00Z",
+			},
+		],
+		commentsCount: 5472,
 	},
 	{
 		id: "2",
@@ -32,7 +58,23 @@ const FEED = [
 		audio: "Original audio",
 		uri: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
 		likes: 3066,
-		comments: 4039583,
+		comments: [
+			{
+				id: "c1",
+				user: "michTransfer",
+				text: "Scrolling feels like TikTok 👏",
+				likes: 15,
+				createdAt: "2026-01-10T14:10:00Z",
+			},
+			{
+				id: "c2",
+				user: "uiux",
+				text: "Rail spacing is perfect",
+				likes: 7,
+				createdAt: "2026-01-10T14:11:00Z",
+			},
+		],
+		commentsCount: 4039583,
 	},
 	{
 		id: "3",
@@ -41,11 +83,34 @@ const FEED = [
 		audio: "Original audio",
 		uri: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4",
 		likes: 66,
-		comments: 39583,
+		comments: [
+			{
+				id: "c1",
+				user: "sam",
+				text: "Autoplay logic works great",
+				likes: 3,
+				createdAt: "2026-01-10T14:20:00Z",
+			},
+			{
+				id: "c2",
+				user: "andrew",
+				text: "Next: add a comments modal 😈",
+				likes: 5,
+				createdAt: "2026-01-10T14:22:00Z",
+			},
+			{
+				id: "c3",
+				user: "qa",
+				text: "Does this reset time when offscreen? (it should)",
+				likes: 2,
+				createdAt: "2026-01-10T14:24:00Z",
+			},
+		],
+		commentsCount: 39583,
 	},
 ];
 
-// 1534 -> "1.5k", up to 1T
+// 1534 -> "1.5k", supports up to trillions.
 function convertNumberToLetter(num) {
 	if (num == null || Number.isNaN(num)) return "";
 
@@ -90,16 +155,64 @@ function convertNumberToLetter(num) {
 	}
 }
 
-function VideoPost({ item, active }) {
+function normalizeForSearch(value) {
+	if (!value) return "";
+	return String(value)
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, " ")
+		.trim();
+}
+
+function textMatchesQuery(query, text) {
+	const normalizedQuery = normalizeForSearch(query);
+	if (!normalizedQuery) return false;
+	const normalizedText = normalizeForSearch(text);
+	if (!normalizedText) return false;
+
+	const tokens = normalizedQuery.split(" ").filter(Boolean);
+	return tokens.every((token) => normalizedText.includes(token));
+}
+
+function getSearchMatchesInOrder(items, query) {
+	if (!query.trim()) return items;
+
+	const checks = [
+		{ label: "username", getText: (post) => post.username },
+		{ label: "caption", getText: (post) => post.caption },
+		{ label: "audio", getText: (post) => post.audio },
+		{
+			label: "captions",
+			getText: (post) => (post.comments ?? []).map((c) => c.text).join(" "),
+		},
+	];
+
+	const matchedIds = new Set();
+	const orderedMatches = [];
+
+	for (const check of checks) {
+		for (const post of items) {
+			if (matchedIds.has(post.id)) continue;
+			if (textMatchesQuery(query, check.getText(post))) {
+				matchedIds.add(post.id);
+				orderedMatches.push(post);
+			}
+		}
+	}
+
+	return orderedMatches;
+}
+
+// Renders a single full-screen video cell with engagement actions.
+function VideoPost({ item, active, likesCount, onToggleLike, onOpenComments }) {
+	// Create a video player instance per item.
 	const player = useVideoPlayer(item.uri, (player) => {
 		player.loop = true;
 		player.muted = false;
 	});
 
 	const [paused, setPaused] = useState(false);
-	const [liked, setLiked] = useState(false);
 
-	// Like pop animation
+	// Like pop animation state.
 	const likePop = useRef(new Animated.Value(0)).current;
 
 	const runLikePop = useCallback(() => {
@@ -122,17 +235,14 @@ function VideoPost({ item, active }) {
 		]).start();
 	}, [likePop]);
 
-	// NEW: play/pause icon overlay animation
-	const playPauseOpacity = useRef(new Animated.Value(0)).current; // 0 hidden -> 1 visible
+	// Play/pause icon overlay animation.
+	const playPauseOpacity = useRef(new Animated.Value(0)).current;
 	const playPauseScale = useRef(new Animated.Value(1)).current;
 	const hideTimerRef = useRef(null);
 
+	// Show the overlay and optionally auto-hide it for "play".
 	const showPlayPauseIcon = useCallback(
 		(mode) => {
-			// mode: "pause" | "play"
-			// show icon, then:
-			//  - if pause: stay visible (until next toggle)
-			//  - if play: hide after ~0.5s
 			if (hideTimerRef.current) {
 				clearTimeout(hideTimerRef.current);
 				hideTimerRef.current = null;
@@ -174,48 +284,46 @@ function VideoPost({ item, active }) {
 	);
 
 	useEffect(() => {
+		// Cleanup any pending hide timer on unmount.
 		return () => {
-			// cleanup timer on unmount
 			if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
 		};
 	}, []);
 
-	// Auto-play only when visible
+	// Auto-play only when visible in the list.
 	useEffect(() => {
 		if (active) {
 			player.play();
 			setPaused(false);
-			// optional: don't show play icon when auto-playing
-			// showPlayPauseIcon("play");
 		} else {
 			player.pause();
 			player.currentTime = 0;
 			setPaused(false);
-			// hide icon when offscreen
 			playPauseOpacity.setValue(0);
 		}
 	}, [active, player, playPauseOpacity]);
 
 	const onToggleVideo = useCallback(() => {
+		// Tap-to-toggle playback and show the overlay.
 		if (paused) {
 			player.play();
 			setPaused(false);
-			showPlayPauseIcon("play"); // show briefly
+			showPlayPauseIcon("play");
 		} else {
 			player.pause();
 			setPaused(true);
-			showPlayPauseIcon("pause"); // stay visible
+			showPlayPauseIcon("pause");
 		}
 	}, [paused, player, showPlayPauseIcon]);
 
+	// Like toggling updates App state and triggers a pop animation.
 	const onPressLike = useCallback(() => {
-		setLiked((prev) => !prev);
+		onToggleLike(item.id);
 		runLikePop();
-	}, [runLikePop]);
+	}, [item.id, onToggleLike, runLikePop]);
 
 	return (
 		<View style={styles.page}>
-			{/* Tap anywhere EXCEPT the right rail to pause/play */}
 			<TouchableWithoutFeedback onPress={onToggleVideo}>
 				<View style={StyleSheet.absoluteFill}>
 					<VideoView
@@ -227,7 +335,6 @@ function VideoPost({ item, active }) {
 				</View>
 			</TouchableWithoutFeedback>
 
-			{/* NEW: play/pause icon overlay (center) */}
 			<Animated.View
 				pointerEvents="none"
 				style={[
@@ -238,39 +345,42 @@ function VideoPost({ item, active }) {
 					},
 				]}
 			>
-				{/* Use text icons so you don't need extra libs */}
-				<Text style={styles.playPauseIcon}>
-					{/* when paused: show play icon; when playing: show pause icon briefly */}
-					{paused ? "▶" : "❚❚"}
-				</Text>
+				<Text style={styles.playPauseIcon}>{paused ? "▶" : "❚❚"}</Text>
 			</Animated.View>
 
-			{/* Overlay UI (touchable, stops the outer tap from firing) */}
 			<View style={styles.rightRail} pointerEvents="box-none">
+				{/* Like button */}
 				<TouchableOpacity
 					activeOpacity={0.85}
 					onPress={onPressLike}
 					hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}
 					style={styles.railButton}
 				>
-					<Text style={[styles.icon, liked && styles.iconLiked]}>
-						{liked ? "♥" : "♡"}
+					{/* Heart filled if this post is liked in app state. */}
+					<Text style={[styles.icon, item.isLiked && styles.iconLiked]}>
+						{item.isLiked ? "♥" : "♡"}
 					</Text>
-					<Text style={styles.count}>{convertNumberToLetter(item.likes)}</Text>
+
+					{/* Show updated like count from state. */}
+					<Text style={styles.count}>{convertNumberToLetter(likesCount)}</Text>
 				</TouchableOpacity>
 
+				{/* Comments button */}
 				<TouchableOpacity
 					activeOpacity={0.85}
-					onPress={() => console.log("comments")}
+					onPress={() => onOpenComments(item.id)}
 					hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}
 					style={styles.railButton}
 				>
 					<Text style={styles.icon}>💬</Text>
 					<Text style={styles.count}>
-						{convertNumberToLetter(item.comments)}
+						{convertNumberToLetter(
+							item.commentsCount ?? item.comments?.length ?? 0
+						)}
 					</Text>
 				</TouchableOpacity>
 
+				{/* Share button placeholder */}
 				<TouchableOpacity
 					activeOpacity={0.85}
 					onPress={() => console.log("share")}
@@ -282,7 +392,7 @@ function VideoPost({ item, active }) {
 				</TouchableOpacity>
 			</View>
 
-			{/* Like popup "pop" animation */}
+			{/* Like pop animation overlay */}
 			<Animated.View
 				pointerEvents="none"
 				style={[
@@ -303,6 +413,7 @@ function VideoPost({ item, active }) {
 				<Text style={styles.likePopText}>♥</Text>
 			</Animated.View>
 
+			{/* Post metadata */}
 			<View style={styles.bottomMeta} pointerEvents="none">
 				<Text style={styles.username}>@{item.username}</Text>
 				<Text style={styles.caption}>{item.caption}</Text>
@@ -313,8 +424,39 @@ function VideoPost({ item, active }) {
 }
 
 export default function App() {
+	// Active index controls which item should auto-play.
 	const [activeIndex, setActiveIndex] = useState(0);
+	const [searchQuery, setSearchQuery] = useState("");
+	const [isSearchOpen, setIsSearchOpen] = useState(false);
 
+	// Local feed state to store per-item likes and comments.
+	const [feed, setFeed] = useState(() =>
+		FEED.map((p) => ({
+			...p,
+			isLiked: false,
+			likesCount: p.likes,
+		}))
+	);
+
+	// Toggle like: increment if not liked, decrement if liked.
+	const toggleLikeById = useCallback((postId) => {
+		setFeed((prev) =>
+			prev.map((p) => {
+				if (p.id !== postId) return p;
+
+				const nextLiked = !p.isLiked;
+				const base = p.likesCount ?? p.likes ?? 0;
+
+				return {
+					...p,
+					isLiked: nextLiked,
+					likesCount: Math.max(0, base + (nextLiked ? 1 : -1)),
+				};
+			})
+		);
+	}, []);
+
+	// Consider an item active once most of it is visible.
 	const viewabilityConfig = useMemo(
 		() => ({
 			itemVisiblePercentThreshold: 80,
@@ -322,24 +464,126 @@ export default function App() {
 		[]
 	);
 
+	// Track the topmost visible item index.
 	const onViewableItemsChanged = useRef(({ viewableItems }) => {
 		if (!viewableItems.length) return;
 		setActiveIndex(viewableItems[0].index);
 	}).current;
 
+	// Comments sheet state.
+	const [commentsOpen, setCommentsOpen] = useState(false);
+	const [commentsPostId, setCommentsPostId] = useState(null);
+
+	// Open the comments sheet for a specific post.
+	const openCommentsFor = useCallback((postId) => {
+		setCommentsPostId(postId);
+		setCommentsOpen(true);
+	}, []);
+
+	// Close comments sheet and clear selection after animation.
+	const closeComments = useCallback(() => {
+		setCommentsOpen(false);
+		setTimeout(() => setCommentsPostId(null), 220);
+	}, []);
+
+	// Resolve the post shown in the comments sheet.
+	const activeCommentsPost = useMemo(() => {
+		return feed.find((p) => p.id === commentsPostId) ?? null;
+	}, [feed, commentsPostId]);
+
+	// Append a new comment to the active post.
+	const addCommentToActivePost = useCallback(
+		(text) => {
+			if (!commentsPostId) return;
+
+			setFeed((prev) =>
+				prev.map((p) => {
+					if (p.id !== commentsPostId) return p;
+
+					const newComment = {
+						id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+						user: "andrew", // TODO: replace with current user
+						text,
+						likes: 0,
+						createdAt: new Date().toISOString(),
+					};
+
+					const nextComments = [newComment, ...(p.comments ?? [])];
+
+					return {
+						...p,
+						comments: nextComments,
+						commentsCount: (p.commentsCount ?? p.comments?.length ?? 0) + 1,
+					};
+				})
+			);
+		},
+		[commentsPostId, setFeed]
+	);
+
+	const filteredFeed = useMemo(() => {
+		return getSearchMatchesInOrder(feed, searchQuery);
+	}, [feed, searchQuery]);
+
+	useEffect(() => {
+		setActiveIndex(0);
+	}, [searchQuery]);
 	return (
 		<View style={styles.container}>
+			{/* Transparent status bar for immersive video */}
 			<StatusBar
 				translucent
 				backgroundColor="transparent"
 				barStyle="light-content"
 			/>
 
+			<View style={styles.searchBar}>
+				{isSearchOpen ? (
+					<View style={styles.searchInputRow}>
+						<TextInput
+							value={searchQuery}
+							onChangeText={setSearchQuery}
+							placeholder="Search videos"
+							placeholderTextColor="rgba(255,255,255,0.6)"
+							autoCapitalize="none"
+							autoCorrect={false}
+							clearButtonMode="while-editing"
+							style={styles.searchInput}
+						/>
+						<TouchableOpacity
+							onPress={() => {
+								setIsSearchOpen(false);
+								setSearchQuery("");
+							}}
+							hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+							style={styles.searchClose}
+						>
+							<Text style={styles.searchIcon}>✕</Text>
+						</TouchableOpacity>
+					</View>
+				) : (
+					<TouchableOpacity
+						onPress={() => setIsSearchOpen(true)}
+						hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+						style={styles.searchButton}
+					>
+						<Text style={styles.searchIcon}>🔍</Text>
+					</TouchableOpacity>
+				)}
+			</View>
+
+			{/* Full-screen, paged vertical feed */}
 			<FlatList
-				data={FEED}
+				data={filteredFeed}
 				keyExtractor={(item) => item.id}
 				renderItem={({ item, index }) => (
-					<VideoPost item={item} active={index === activeIndex} />
+					<VideoPost
+						item={item}
+						active={index === activeIndex}
+						likesCount={item.likesCount}
+						onToggleLike={toggleLikeById}
+						onOpenComments={openCommentsFor}
+					/>
 				)}
 				pagingEnabled
 				showsVerticalScrollIndicator={false}
@@ -353,6 +597,22 @@ export default function App() {
 				windowSize={3}
 				initialNumToRender={2}
 				removeClippedSubviews
+			/>
+
+			{isSearchOpen &&
+				searchQuery.trim().length > 0 &&
+				filteredFeed.length === 0 && (
+				<View style={styles.emptyState} pointerEvents="none">
+					<Text style={styles.emptyStateText}>
+						No matches in caption, audio, or captions.
+					</Text>
+				</View>
+			)}
+			<CommentsSection
+				visible={commentsOpen}
+				post={activeCommentsPost}
+				onClose={closeComments}
+				onAddComment={addCommentToActivePost}
 			/>
 		</View>
 	);
@@ -387,7 +647,6 @@ const styles = StyleSheet.create({
 	caption: { color: "white", marginTop: 6 },
 	audio: { color: "rgba(255,255,255,0.8)", marginTop: 4 },
 
-	// NEW: centered play/pause icon overlay
 	playPauseOverlay: {
 		position: "absolute",
 		alignSelf: "center",
@@ -395,7 +654,7 @@ const styles = StyleSheet.create({
 		width: 68,
 		height: 68,
 		borderRadius: 34,
-		backgroundColor: "rgba(0,0,0,0.35)", // slightly transparent
+		backgroundColor: "rgba(0,0,0,0.35)",
 		alignItems: "center",
 		justifyContent: "center",
 	},
@@ -413,5 +672,66 @@ const styles = StyleSheet.create({
 	likePopText: {
 		color: "red",
 		fontSize: 72,
+	},
+
+	searchBar: {
+		position: "absolute",
+		top: 48,
+		left: 12,
+		right: 12,
+		zIndex: 20,
+		alignItems: "flex-end"
+	},
+	searchInputRow: {
+		flexDirection: "row",
+		alignItems: "center",
+		gap: 10,
+	},
+	searchInput: {
+		flex: 1,
+		height: 40,
+		borderRadius: 20,
+		paddingHorizontal: 16,
+		color: "white",
+		backgroundColor: "rgba(0,0,0,0.45)",
+		borderWidth: 1,
+		borderColor: "rgba(255,255,255,0.2)",
+	},
+	searchButton: {
+		width: 40,
+		height: 40,
+		borderRadius: 20,
+		alignItems: "center",
+		justifyContent: "center",
+
+		// ✅ remove dark circle/background + border
+		backgroundColor: "transparent",
+		borderWidth: 0,
+	},
+
+	searchClose: {
+		width: 32,
+		height: 32,
+		borderRadius: 16,
+		alignItems: "center",
+		justifyContent: "center",
+		backgroundColor: "rgba(0,0,0,0.45)",
+		borderWidth: 1,
+		borderColor: "rgba(255,255,255,0.2)",
+	},
+	searchIcon: {
+		color: "white",
+		fontSize: 16,
+	},
+	emptyState: {
+		position: "absolute",
+		top: H / 2 - 20,
+		left: 24,
+		right: 24,
+		alignItems: "center",
+	},
+	emptyStateText: {
+		color: "rgba(255,255,255,0.8)",
+		textAlign: "center",
 	},
 });
