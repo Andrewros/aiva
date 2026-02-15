@@ -4,6 +4,7 @@ import {
 	Text,
 	StyleSheet,
 	Dimensions,
+	ActivityIndicator,
 	FlatList,
 	TouchableWithoutFeedback,
 	TouchableOpacity,
@@ -16,6 +17,7 @@ import {
 } from "react-native";
 import { VideoView, useVideoPlayer } from "expo-video";
 import * as ImagePicker from "expo-image-picker";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import CommentsSection from "./CommentsSection";
 
 // Screen size used to size pages/videos for a full-screen vertical feed.
@@ -28,6 +30,7 @@ function resolveApiBaseUrl(rawValue) {
 }
 
 const API_BASE_URL = resolveApiBaseUrl(process.env.EXPO_PUBLIC_API_BASE_URL);
+const AUTH_SESSION_STORAGE_KEY = "aiva_auth_session_v1";
 
 // 1534 -> "1.5k", supports up to trillions.
 function convertNumberToLetter(num) {
@@ -438,8 +441,20 @@ function VideoPost(props) {
 }
 
 export default function App() {
-	const currentUser = "andrew";
-	const currentUserId = "andrew";
+	const [authBooting, setAuthBooting] = useState(true);
+	const [authToken, setAuthToken] = useState(null);
+	const [authUser, setAuthUser] = useState(null);
+	const [authMode, setAuthMode] = useState("login");
+	const [authStep, setAuthStep] = useState("credentials");
+	const [authPhone, setAuthPhone] = useState("");
+	const [authPassword, setAuthPassword] = useState("");
+	const [authUsername, setAuthUsername] = useState("");
+	const [authCode, setAuthCode] = useState("");
+	const [authBusy, setAuthBusy] = useState(false);
+	const [authError, setAuthError] = useState(null);
+	const [authDebugCode, setAuthDebugCode] = useState("");
+	const currentUser = authUser?.username ?? "";
+	const currentUserId = authUser?.id ?? "";
 	// Active index controls which item should auto-play.
 	const [activeIndex, setActiveIndex] = useState(0);
 	const [searchQuery, setSearchQuery] = useState("");
@@ -454,19 +469,31 @@ export default function App() {
 	const [pendingFeedIndex, setPendingFeedIndex] = useState(null);
 	const [isGeneratingAiva, setIsGeneratingAiva] = useState(false);
 	const [isAivaPromptOpen, setIsAivaPromptOpen] = useState(false);
+	const [aivaTitle, setAivaTitle] = useState("");
 	const [aivaPromptText, setAivaPromptText] = useState("");
 	const [aivaImageUrlInput, setAivaImageUrlInput] = useState("");
 	const [aivaImages, setAivaImages] = useState([]);
 	const [aivaDuration, setAivaDuration] = useState(10);
 	const [aivaError, setAivaError] = useState(null);
+	const [isAivaWaiting, setIsAivaWaiting] = useState(false);
+	const [aivaProgress, setAivaProgress] = useState(0);
+	const [isResettingUploads, setIsResettingUploads] = useState(false);
 	const aivaPollRef = useRef(null);
+	const aivaProgressTimerRef = useRef(null);
 
 	// Local feed state to store per-item likes and comments.
 	const [feed, setFeed] = useState([]);
 
-	const apiFetch = useCallback(async (path, options) => {
+	const apiFetch = useCallback(async (path, options = {}) => {
+		const headers = { ...(options.headers || {}) };
+		if (authToken && !headers.Authorization) {
+			headers.Authorization = `Bearer ${authToken}`;
+		}
 		try {
-			return await fetch(`${API_BASE_URL}${path}`, options);
+			return await fetch(`${API_BASE_URL}${path}`, {
+				...options,
+				headers,
+			});
 		} catch (error) {
 			throw new Error(
 				`Network error reaching API (${API_BASE_URL}): ${
@@ -474,6 +501,55 @@ export default function App() {
 				}`
 			);
 		}
+	}, [authToken]);
+
+	const persistAuthSession = useCallback(async (token, user) => {
+		const payload = { token, user };
+		await AsyncStorage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify(payload));
+		setAuthToken(token);
+		setAuthUser(user);
+	}, []);
+
+	const clearAuthSession = useCallback(async () => {
+		setAuthToken(null);
+		setAuthUser(null);
+		setAuthStep("credentials");
+		setAuthError(null);
+		setAuthDebugCode("");
+		await AsyncStorage.removeItem(AUTH_SESSION_STORAGE_KEY);
+	}, []);
+
+	useEffect(() => {
+		const hydrateAuth = async () => {
+			try {
+				const raw = await AsyncStorage.getItem(AUTH_SESSION_STORAGE_KEY);
+				if (!raw) {
+					setAuthBooting(false);
+					return;
+				}
+				const parsed = JSON.parse(raw);
+				if (!parsed?.token) {
+					setAuthBooting(false);
+					return;
+				}
+				const response = await fetch(`${API_BASE_URL}/auth/me`, {
+					headers: { Authorization: `Bearer ${parsed.token}` },
+				});
+				if (!response.ok) {
+					await AsyncStorage.removeItem(AUTH_SESSION_STORAGE_KEY);
+					setAuthBooting(false);
+					return;
+				}
+				const data = await response.json();
+				setAuthToken(parsed.token);
+				setAuthUser(data?.user || null);
+			} catch {
+				await AsyncStorage.removeItem(AUTH_SESSION_STORAGE_KEY);
+			} finally {
+				setAuthBooting(false);
+			}
+		};
+		hydrateAuth();
 	}, []);
 
 	const hydrateFeed = useCallback((items) => {
@@ -507,23 +583,9 @@ export default function App() {
 	}, [apiFetch, currentUserId, hydrateFeed]);
 
 	useEffect(() => {
-		const run = async () => {
-			try {
-				await apiFetch("/login", {
-					method: "POST",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({
-						userId: currentUserId,
-						username: currentUser,
-					}),
-				});
-			} catch (error) {
-				console.warn("Login request failed:", error);
-			}
-			loadFeed();
-		};
-		run();
-	}, [apiFetch, currentUser, currentUserId, loadFeed]);
+		if (!authUser || !authToken) return;
+		loadFeed();
+	}, [authToken, authUser, loadFeed]);
 
 	useEffect(() => {
 		return () => {
@@ -531,19 +593,19 @@ export default function App() {
 				clearInterval(aivaPollRef.current);
 				aivaPollRef.current = null;
 			}
+			if (aivaProgressTimerRef.current) {
+				clearInterval(aivaProgressTimerRef.current);
+				aivaProgressTimerRef.current = null;
+			}
 		};
 	}, []);
 
 	const addAivaImageUrl = useCallback(() => {
 		const trimmed = aivaImageUrlInput.trim();
 		if (!trimmed) return;
-		setAivaImages((prev) => {
-			if (prev.length >= 10) return prev;
-			return [
-				...prev,
-				{ id: `${Date.now()}-${Math.random()}`, type: "url", uri: trimmed },
-			];
-		});
+		setAivaImages([
+			{ id: `${Date.now()}-${Math.random()}`, type: "url", uri: trimmed },
+		]);
 		setAivaImageUrlInput("");
 	}, [aivaImageUrlInput]);
 
@@ -555,6 +617,12 @@ export default function App() {
 		if (aivaPollRef.current) {
 			clearInterval(aivaPollRef.current);
 		}
+		if (aivaProgressTimerRef.current) {
+			clearInterval(aivaProgressTimerRef.current);
+		}
+		aivaProgressTimerRef.current = setInterval(() => {
+			setAivaProgress((prev) => (prev >= 95 ? prev : prev + 3));
+		}, 1000);
 
 		aivaPollRef.current = setInterval(async () => {
 			try {
@@ -567,11 +635,26 @@ export default function App() {
 				if (status === "succeeded") {
 					clearInterval(aivaPollRef.current);
 					aivaPollRef.current = null;
+					if (aivaProgressTimerRef.current) {
+						clearInterval(aivaProgressTimerRef.current);
+						aivaProgressTimerRef.current = null;
+					}
+					setAivaProgress(100);
 					await loadFeed();
+					setTimeout(() => {
+						setIsAivaWaiting(false);
+						setAivaProgress(0);
+					}, 250);
 				}
 				if (status === "failed" || status === "blocked") {
 					clearInterval(aivaPollRef.current);
 					aivaPollRef.current = null;
+					if (aivaProgressTimerRef.current) {
+						clearInterval(aivaProgressTimerRef.current);
+						aivaProgressTimerRef.current = null;
+					}
+					setIsAivaWaiting(false);
+					setAivaProgress(0);
 					setAivaError(data?.job?.error || "AIVA generation failed.");
 				}
 			} catch (error) {
@@ -597,78 +680,81 @@ export default function App() {
 		const asset = result.assets?.[0];
 		if (!asset?.uri) return;
 
-		setAivaImages((prev) => {
-			if (prev.length >= 10) return prev;
-			return [
-				...prev,
-				{
-					id: `${Date.now()}-${Math.random()}`,
-					type: "local",
-					uri: asset.uri,
-					name: asset.fileName,
-					mimeType: asset.mimeType,
-				},
-			];
-		});
+		setAivaImages([
+			{
+				id: `${Date.now()}-${Math.random()}`,
+				type: "local",
+				uri: asset.uri,
+				name: asset.fileName,
+				mimeType: asset.mimeType,
+			},
+		]);
 	}, []);
 
 	const uploadAivaImagesIfNeeded = useCallback(async () => {
-		const localImages = aivaImages.filter((img) => img.type === "local");
-		if (!localImages.length) return [];
+		const img = aivaImages.find((item) => item.type === "local");
+		if (!img) return null;
 
-		const uploads = await Promise.all(
-			localImages.map(async (img) => {
-				const name = img.name || img.uri.split("/").pop();
-				const type = img.mimeType || "image/jpeg";
+		const name = img.name || img.uri.split("/").pop();
+		const type = img.mimeType || "image/jpeg";
 
-				const formData = new FormData();
-				formData.append("image", {
-					uri: img.uri,
-					name: name || "aiva.jpg",
-					type,
-				});
+		const formData = new FormData();
+		formData.append("image", {
+			uri: img.uri,
+			name: name || "aiva.jpg",
+			type,
+		});
 
-				const response = await apiFetch("/aiva/prompt-image", {
-					method: "POST",
-					body: formData,
-				});
+		const response = await apiFetch("/aiva/prompt-image", {
+			method: "POST",
+			body: formData,
+		});
 
-				if (!response.ok) {
-					throw new Error(`Image upload failed (${response.status})`);
-				}
+		if (!response.ok) {
+			throw new Error(`Image upload failed (${response.status})`);
+		}
 
-				const data = await response.json();
-				return data?.imageUrl || null;
-			})
-		);
-
-		return uploads.filter(Boolean);
+		const data = await response.json();
+		return data?.imageUrl || null;
 	}, [aivaImages, apiFetch]);
 
 	const handleGenerateAiva = useCallback(async () => {
 		if (isGeneratingAiva) return;
 		setIsGeneratingAiva(true);
 		setAivaError(null);
+		setAivaProgress(5);
 
 		try {
-			const urlImages = aivaImages
-				.filter((img) => img.type === "url")
-				.map((img) => img.uri)
-				.filter(Boolean);
-			const uploadedImages = await uploadAivaImagesIfNeeded();
-			const imageUrls = [...urlImages, ...uploadedImages].slice(0, 10);
-
-			if (!imageUrls.length) {
-				throw new Error("Provide at least one image (URL or photo).");
+			const trimmedTitle = aivaTitle.trim();
+			if (!trimmedTitle) {
+				throw new Error("Title is required.");
 			}
 
+			const selectedImage = aivaImages[0];
+			if (!selectedImage) {
+				throw new Error("Provide one image (URL or photo).");
+			}
+
+			let finalImageUrl = null;
+			if (selectedImage.type === "url") {
+				finalImageUrl = selectedImage.uri;
+			} else {
+				finalImageUrl = await uploadAivaImagesIfNeeded();
+			}
+
+			if (!finalImageUrl) {
+				throw new Error("Could not prepare image for generation.");
+			}
+
+			setIsAivaWaiting(true);
 			const response = await apiFetch("/aiva/generate", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({
 					userId: currentUserId,
+					title: trimmedTitle,
 					promptText: aivaPromptText.trim(),
-					imageUrls,
+					imageUrls: [finalImageUrl],
 					duration: Number(aivaDuration),
 				}),
 			});
@@ -677,8 +763,11 @@ export default function App() {
 				throw new Error(body?.error || `AIVA request failed (${response.status})`);
 			}
 			startAivaPolling();
+			setAivaTitle("");
 			setIsAivaPromptOpen(false);
 		} catch (error) {
+			setIsAivaWaiting(false);
+			setAivaProgress(0);
 			setAivaError(error?.message ?? "AIVA generation failed.");
 			console.warn("AIVA generation failed:", error);
 		} finally {
@@ -688,11 +777,150 @@ export default function App() {
 		aivaDuration,
 		aivaImages,
 		aivaPromptText,
+		aivaTitle,
 		apiFetch,
 		currentUserId,
 		isGeneratingAiva,
 		uploadAivaImagesIfNeeded,
 	]);
+
+	const handleResetUploadCount = useCallback(async () => {
+		if (isResettingUploads || currentUserId !== "andrew") return;
+		setIsResettingUploads(true);
+		setAivaError(null);
+		try {
+			const response = await apiFetch("/aiva/reset-upload-count", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ userId: currentUserId }),
+			});
+			if (!response.ok) {
+				const body = await response.json().catch(() => ({}));
+				throw new Error(body?.error || `Reset failed (${response.status})`);
+			}
+			await loadFeed();
+		} catch (error) {
+			setAivaError(error?.message ?? "Failed to reset upload count.");
+		} finally {
+			setIsResettingUploads(false);
+		}
+	}, [apiFetch, currentUserId, isResettingUploads, loadFeed]);
+
+	const handleStartRegister = useCallback(async () => {
+		setAuthBusy(true);
+		setAuthError(null);
+		setAuthDebugCode("");
+		try {
+			const response = await apiFetch("/auth/register/start", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					phone: authPhone.trim(),
+					password: authPassword,
+				}),
+			});
+			const body = await response.json().catch(() => ({}));
+			if (!response.ok) {
+				throw new Error(body?.error || `Register failed (${response.status})`);
+			}
+			setAuthStep("otp");
+			setAuthDebugCode(String(body?.devOtp || ""));
+		} catch (error) {
+			setAuthError(error?.message ?? "Failed to start registration.");
+		} finally {
+			setAuthBusy(false);
+		}
+	}, [apiFetch, authPassword, authPhone]);
+
+	const handleVerifyRegister = useCallback(async () => {
+		setAuthBusy(true);
+		setAuthError(null);
+		try {
+			const response = await apiFetch("/auth/register/verify", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					phone: authPhone.trim(),
+					code: authCode.trim(),
+					username: authUsername.trim(),
+				}),
+			});
+			const body = await response.json().catch(() => ({}));
+			if (!response.ok) {
+				throw new Error(body?.error || `Verify failed (${response.status})`);
+			}
+			await persistAuthSession(body.token, body.user);
+		} catch (error) {
+			setAuthError(error?.message ?? "Failed to verify registration.");
+		} finally {
+			setAuthBusy(false);
+		}
+	}, [
+		apiFetch,
+		authCode,
+		authPhone,
+		authUsername,
+		persistAuthSession,
+	]);
+
+	const handleStartLogin = useCallback(async () => {
+		setAuthBusy(true);
+		setAuthError(null);
+		setAuthDebugCode("");
+		try {
+			const response = await apiFetch("/auth/login/start", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					phone: authPhone.trim(),
+					password: authPassword,
+				}),
+			});
+			const body = await response.json().catch(() => ({}));
+			if (!response.ok) {
+				throw new Error(body?.error || `Login failed (${response.status})`);
+			}
+			setAuthStep("otp");
+			setAuthDebugCode(String(body?.devOtp || ""));
+		} catch (error) {
+			setAuthError(error?.message ?? "Failed to start login.");
+		} finally {
+			setAuthBusy(false);
+		}
+	}, [apiFetch, authPassword, authPhone]);
+
+	const handleVerifyLogin = useCallback(async () => {
+		setAuthBusy(true);
+		setAuthError(null);
+		try {
+			const response = await apiFetch("/auth/login/verify", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					phone: authPhone.trim(),
+					code: authCode.trim(),
+				}),
+			});
+			const body = await response.json().catch(() => ({}));
+			if (!response.ok) {
+				throw new Error(body?.error || `Verify failed (${response.status})`);
+			}
+			await persistAuthSession(body.token, body.user);
+		} catch (error) {
+			setAuthError(error?.message ?? "Failed to verify login.");
+		} finally {
+			setAuthBusy(false);
+		}
+	}, [apiFetch, authCode, authPhone, persistAuthSession]);
+
+	const handleLogout = useCallback(async () => {
+		try {
+			await apiFetch("/auth/logout", { method: "POST" });
+		} catch {
+			// ignore network/logout failures; local session is source of truth for UI.
+		}
+		await clearAuthSession();
+	}, [apiFetch, clearAuthSession]);
 
 	// Toggle like: increment if not liked, decrement if liked.
 	const toggleLikeById = useCallback((postId) => {
@@ -878,6 +1106,115 @@ export default function App() {
 		}
 	}).current;
 
+	if (authBooting) {
+		return (
+			<View style={styles.authContainer}>
+				<ActivityIndicator size="large" color="#ffffff" />
+				<Text style={styles.authLoadingText}>Checking session...</Text>
+			</View>
+		);
+	}
+
+	if (!authUser) {
+		const isRegister = authMode === "register";
+		const isOtpStep = authStep === "otp";
+
+		return (
+			<View style={styles.authContainer}>
+				<Text style={styles.authTitle}>Welcome to AIVA</Text>
+				<Text style={styles.authSubtitle}>
+					{isRegister ? "Create account" : "Sign in"} with phone + password, then
+					verify with a phone code.
+				</Text>
+				<TextInput
+					value={authPhone}
+					onChangeText={setAuthPhone}
+					placeholder="Phone number (+15551234567)"
+					placeholderTextColor="rgba(255,255,255,0.5)"
+					autoCapitalize="none"
+					keyboardType="phone-pad"
+					style={styles.authInput}
+				/>
+				<TextInput
+					value={authPassword}
+					onChangeText={setAuthPassword}
+					placeholder="Password (min 8 chars)"
+					placeholderTextColor="rgba(255,255,255,0.5)"
+					secureTextEntry
+					style={styles.authInput}
+				/>
+				{isRegister ? (
+					<TextInput
+						value={authUsername}
+						onChangeText={setAuthUsername}
+						placeholder="Unique username"
+						placeholderTextColor="rgba(255,255,255,0.5)"
+						autoCapitalize="none"
+						style={styles.authInput}
+					/>
+				) : null}
+				{isOtpStep ? (
+					<TextInput
+						value={authCode}
+						onChangeText={setAuthCode}
+						placeholder="6-digit verification code"
+						placeholderTextColor="rgba(255,255,255,0.5)"
+						keyboardType="number-pad"
+						style={styles.authInput}
+					/>
+				) : null}
+				{authDebugCode ? (
+					<Text style={styles.authDevCode}>
+						Dev OTP: {authDebugCode}
+					</Text>
+				) : null}
+				{authError ? <Text style={styles.authError}>{authError}</Text> : null}
+				<TouchableOpacity
+					onPress={
+						isOtpStep
+							? isRegister
+								? handleVerifyRegister
+								: handleVerifyLogin
+							: isRegister
+								? handleStartRegister
+								: handleStartLogin
+					}
+					disabled={authBusy}
+					style={[styles.authPrimaryButton, authBusy && styles.authButtonDisabled]}
+					activeOpacity={0.9}
+				>
+					<Text style={styles.authPrimaryButtonText}>
+						{authBusy
+							? "Please wait..."
+							: isOtpStep
+								? "Verify Code"
+								: isRegister
+									? "Send Verification Code"
+									: "Send Login Code"}
+					</Text>
+				</TouchableOpacity>
+				<TouchableOpacity
+					onPress={() => {
+						setAuthMode(isRegister ? "login" : "register");
+						setAuthStep("credentials");
+						setAuthCode("");
+						setAuthError(null);
+						setAuthDebugCode("");
+					}}
+					disabled={authBusy}
+					activeOpacity={0.85}
+					style={styles.authSecondaryButton}
+				>
+					<Text style={styles.authSecondaryButtonText}>
+						{isRegister
+							? "Already have an account? Sign in"
+							: "First time? Create an account"}
+					</Text>
+				</TouchableOpacity>
+			</View>
+		);
+	}
+
 	return (
 		<View style={styles.container}>
 			{/* Transparent status bar for immersive video */}
@@ -895,6 +1232,14 @@ export default function App() {
 				<View style={styles.aivaModalBackdrop}>
 					<View style={styles.aivaModalCard}>
 						<Text style={styles.aivaModalTitle}>Generate AIVA Video</Text>
+						<Text style={styles.aivaModalLabel}>Video title</Text>
+						<TextInput
+							value={aivaTitle}
+							onChangeText={setAivaTitle}
+							placeholder="My AIVA video"
+							placeholderTextColor="rgba(255,255,255,0.5)"
+							style={styles.aivaModalInput}
+						/>
 						<Text style={styles.aivaModalLabel}>Prompt text</Text>
 						<TextInput
 							value={aivaPromptText}
@@ -904,7 +1249,7 @@ export default function App() {
 							multiline
 							style={styles.aivaModalInput}
 						/>
-						<Text style={styles.aivaModalLabel}>Prompt images (up to 10)</Text>
+						<Text style={styles.aivaModalLabel}>Prompt image (1 only)</Text>
 						<View style={styles.aivaUrlRow}>
 							<TextInput
 								value={aivaImageUrlInput}
@@ -934,27 +1279,25 @@ export default function App() {
 								</Text>
 							</TouchableOpacity>
 							<Text style={styles.aivaCountText}>
-								{aivaImages.length}/10 selected
+								{aivaImages.length ? "1 selected" : "0 selected"}
 							</Text>
 						</View>
 						{aivaImages.length > 0 && (
 							<View style={styles.aivaPreviewRow}>
-								{aivaImages.map((img) => (
-									<View key={img.id} style={styles.aivaPreviewItem}>
-										<Image source={{ uri: img.uri }} style={styles.aivaPreview} />
-										<TouchableOpacity
-											onPress={() => removeAivaImage(img.id)}
-											activeOpacity={0.8}
-											style={styles.aivaRemoveButton}
-										>
-											<Text style={styles.aivaRemoveText}>✕</Text>
-										</TouchableOpacity>
-									</View>
-								))}
+								<View key={aivaImages[0].id} style={styles.aivaPreviewItem}>
+									<Image source={{ uri: aivaImages[0].uri }} style={styles.aivaPreview} />
+									<TouchableOpacity
+										onPress={() => removeAivaImage(aivaImages[0].id)}
+										activeOpacity={0.8}
+										style={styles.aivaRemoveButton}
+									>
+										<Text style={styles.aivaRemoveText}>✕</Text>
+									</TouchableOpacity>
+								</View>
 							</View>
 						)}
 						<Text style={styles.aivaHintText}>
-							Note: Runway uses the first and last images for transitions.
+							Adding a new image replaces the current image.
 						</Text>
 						<Text style={styles.aivaModalLabel}>Duration</Text>
 						<View style={styles.aivaDurationRow}>
@@ -1008,6 +1351,24 @@ export default function App() {
 					</View>
 				</View>
 			</Modal>
+			{isAivaWaiting ? (
+				<View style={styles.aivaLoadingOverlay} pointerEvents="none">
+					<View style={styles.aivaLoadingCard}>
+						<Text style={styles.aivaLoadingTitle}>Generating video...</Text>
+						<View style={styles.aivaProgressTrack}>
+							<View
+								style={[
+									styles.aivaProgressFill,
+									{ width: `${Math.max(5, Math.min(100, aivaProgress))}%` },
+								]}
+							/>
+						</View>
+						<Text style={styles.aivaLoadingPercent}>
+							{Math.round(Math.max(5, Math.min(100, aivaProgress)))}%
+						</Text>
+					</View>
+				</View>
+			) : null}
 
 			<FlatList
 				ref={pagerRef}
@@ -1036,17 +1397,34 @@ export default function App() {
 											<Text style={styles.aivaSettingsIcon}>✨</Text>
 										</TouchableOpacity>
 										<TouchableOpacity
-											onPress={() => console.log("settings")}
+											onPress={handleLogout}
 											hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
 											style={styles.settingsButton}
 										>
-											<Text style={styles.settingsIcon}>⚙</Text>
+											<Text style={styles.settingsIcon}>⎋</Text>
 										</TouchableOpacity>
 									</View>
 								</View>
 								<View style={styles.profileHeader}>
 									<View style={styles.profileAvatar} />
 									<Text style={styles.profileUsername}>@{currentUser}</Text>
+									{currentUser === "andrew" ? (
+										<TouchableOpacity
+											onPress={handleResetUploadCount}
+											disabled={isResettingUploads}
+											activeOpacity={0.9}
+											style={[
+												styles.resetUploadsButton,
+												isResettingUploads && styles.resetUploadsButtonDisabled,
+											]}
+										>
+											<Text style={styles.resetUploadsButtonText}>
+												{isResettingUploads
+													? "Resetting..."
+													: "Reset Upload Count"}
+											</Text>
+										</TouchableOpacity>
+									) : null}
 								</View>
 								<View style={styles.profileStats}>
 									<View style={styles.profileStat}>
@@ -1221,6 +1599,73 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
+	authContainer: {
+		flex: 1,
+		backgroundColor: "#0b0d14",
+		paddingHorizontal: 20,
+		justifyContent: "center",
+	},
+	authTitle: {
+		color: "white",
+		fontSize: 28,
+		fontWeight: "800",
+		marginBottom: 8,
+	},
+	authSubtitle: {
+		color: "rgba(255,255,255,0.75)",
+		fontSize: 14,
+		lineHeight: 20,
+		marginBottom: 18,
+	},
+	authInput: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+		borderRadius: 12,
+		paddingHorizontal: 12,
+		paddingVertical: 12,
+		color: "white",
+		borderWidth: 1,
+		borderColor: "rgba(255,255,255,0.12)",
+		marginBottom: 10,
+	},
+	authPrimaryButton: {
+		marginTop: 4,
+		paddingVertical: 12,
+		borderRadius: 12,
+		backgroundColor: "#2f83ff",
+		alignItems: "center",
+	},
+	authPrimaryButtonText: {
+		color: "white",
+		fontWeight: "700",
+	},
+	authSecondaryButton: {
+		marginTop: 10,
+		paddingVertical: 10,
+		alignItems: "center",
+	},
+	authSecondaryButtonText: {
+		color: "rgba(255,255,255,0.8)",
+		fontWeight: "600",
+		fontSize: 13,
+	},
+	authError: {
+		color: "#ff8f8f",
+		marginTop: 2,
+		marginBottom: 2,
+	},
+	authDevCode: {
+		color: "rgba(255,255,255,0.7)",
+		marginBottom: 6,
+		fontSize: 12,
+	},
+	authButtonDisabled: {
+		opacity: 0.6,
+	},
+	authLoadingText: {
+		color: "rgba(255,255,255,0.75)",
+		textAlign: "center",
+		marginTop: 12,
+	},
 	container: { flex: 1, backgroundColor: "black" },
 	feedPage: { width: W, height: H, backgroundColor: "black" },
 	profilePage: { width: W, height: H, backgroundColor: "black" },
@@ -1535,6 +1980,50 @@ const styles = StyleSheet.create({
 		fontWeight: "600",
 		fontSize: 12,
 	},
+	aivaLoadingOverlay: {
+		position: "absolute",
+		left: 0,
+		right: 0,
+		top: 0,
+		bottom: 0,
+		zIndex: 40,
+		alignItems: "center",
+		justifyContent: "center",
+		backgroundColor: "rgba(0,0,0,0.38)",
+	},
+	aivaLoadingCard: {
+		width: "82%",
+		maxWidth: 360,
+		backgroundColor: "rgba(20,22,33,0.95)",
+		borderRadius: 14,
+		paddingHorizontal: 14,
+		paddingVertical: 12,
+		borderWidth: 1,
+		borderColor: "rgba(255,255,255,0.1)",
+	},
+	aivaLoadingTitle: {
+		color: "white",
+		fontSize: 14,
+		fontWeight: "600",
+		marginBottom: 8,
+	},
+	aivaProgressTrack: {
+		height: 9,
+		borderRadius: 999,
+		backgroundColor: "rgba(255,255,255,0.14)",
+		overflow: "hidden",
+	},
+	aivaProgressFill: {
+		height: "100%",
+		borderRadius: 999,
+		backgroundColor: "#2f83ff",
+	},
+	aivaLoadingPercent: {
+		color: "rgba(255,255,255,0.86)",
+		fontSize: 12,
+		marginTop: 8,
+		textAlign: "right",
+	},
 
 	searchClose: {
 		width: 32,
@@ -1626,6 +2115,23 @@ const styles = StyleSheet.create({
 		fontWeight: "700",
 		fontSize: 16,
 		marginTop: 12,
+	},
+	resetUploadsButton: {
+		marginTop: 12,
+		paddingHorizontal: 12,
+		paddingVertical: 8,
+		borderRadius: 999,
+		backgroundColor: "rgba(255,90,90,0.2)",
+		borderWidth: 1,
+		borderColor: "rgba(255,90,90,0.5)",
+	},
+	resetUploadsButtonDisabled: {
+		opacity: 0.55,
+	},
+	resetUploadsButtonText: {
+		color: "white",
+		fontSize: 12,
+		fontWeight: "700",
 	},
 	profileStats: {
 		marginTop: 20,
