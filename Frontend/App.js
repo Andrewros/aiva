@@ -31,6 +31,8 @@ function resolveApiBaseUrl(rawValue) {
 
 const API_BASE_URL = resolveApiBaseUrl(process.env.EXPO_PUBLIC_API_BASE_URL);
 const AUTH_SESSION_STORAGE_KEY = "aiva_auth_session_v1";
+const MAX_AIVA_IMAGES = 12;
+const AIVA_SECONDS_PER_IMAGE = 5;
 
 // 1534 -> "1.5k", supports up to trillions.
 function convertNumberToLetter(num) {
@@ -151,6 +153,96 @@ function normalizeFeedItems(items) {
 	}
 
 	return normalized;
+}
+
+function tokenizeText(value) {
+	return String(value || "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, " ")
+		.trim()
+		.split(/\s+/)
+		.filter((token) => token.length >= 3);
+}
+
+function getPostTokenSet(post) {
+	const commentsText = Array.isArray(post?.comments)
+		? post.comments.map((c) => c?.text || "").join(" ")
+		: "";
+	return new Set(
+		tokenizeText(
+			`${post?.username || ""} ${post?.caption || ""} ${post?.audio || ""} ${commentsText}`
+		)
+	);
+}
+
+function rankFeedItems({
+	items,
+	followedUsers,
+	userCommentCountsById,
+	userViewCountsById,
+}) {
+	const W_SUBSCRIBED = 120;
+	const W_LIKED = 95;
+	const W_COMMENTED = 35;
+	const W_VIEWS = 22;
+	const W_SIMILARITY = 80;
+
+	const prepared = items.map((post, index) => ({
+		post,
+		index,
+		tokens: getPostTokenSet(post),
+	}));
+
+	const profileTokenWeights = {};
+	for (const item of prepared) {
+		const { post, tokens } = item;
+		const liked = !!post.isLiked;
+		const subscribed = followedUsers.has(post.username);
+		const commentsByUser = Number(userCommentCountsById[post.id] || 0);
+		const viewsByUser = Number(userViewCountsById[post.id] || 0);
+		let interactionWeight = 0;
+		if (subscribed) interactionWeight += 4.0;
+		if (liked) interactionWeight += 3.5;
+		if (commentsByUser > 0) interactionWeight += 1.2 * commentsByUser;
+		if (viewsByUser > 0) interactionWeight += Math.min(2.2, Math.log1p(viewsByUser));
+		if (interactionWeight <= 0) continue;
+		for (const token of tokens) {
+			profileTokenWeights[token] =
+				(profileTokenWeights[token] || 0) + interactionWeight;
+		}
+	}
+
+	const profileMass = Object.values(profileTokenWeights).reduce(
+		(sum, value) => sum + value,
+		0
+	);
+
+	const scored = prepared.map(({ post, index, tokens }) => {
+		const commentsByUser = Number(userCommentCountsById[post.id] || 0);
+		const viewsByUser = Number(userViewCountsById[post.id] || 0);
+
+		let similarity = 0;
+		if (profileMass > 0 && tokens.size > 0) {
+			let overlap = 0;
+			for (const token of tokens) overlap += profileTokenWeights[token] || 0;
+			similarity = overlap / profileMass;
+		}
+
+		let score = 0;
+		if (followedUsers.has(post.username)) score += W_SUBSCRIBED;
+		if (post.isLiked) score += W_LIKED;
+		score += Math.min(3, commentsByUser) * W_COMMENTED;
+		score += Math.min(2.5, Math.log1p(viewsByUser)) * W_VIEWS;
+		score += similarity * W_SIMILARITY;
+
+		return { post, score, index };
+	});
+
+	scored.sort((a, b) => {
+		if (b.score !== a.score) return b.score - a.score;
+		return a.index - b.index;
+	});
+	return scored.map((entry) => entry.post);
 }
 
 function FollowButton({
@@ -455,6 +547,7 @@ export default function App() {
 	const [authDebugCode, setAuthDebugCode] = useState("");
 	const currentUser = authUser?.username ?? "";
 	const currentUserId = authUser?.id ?? "";
+	const currentUserProfilePicture = String(authUser?.profilePicture || "").trim();
 	// Active index controls which item should auto-play.
 	const [activeIndex, setActiveIndex] = useState(0);
 	const [searchQuery, setSearchQuery] = useState("");
@@ -470,14 +563,28 @@ export default function App() {
 	const [isGeneratingAiva, setIsGeneratingAiva] = useState(false);
 	const [isAivaPromptOpen, setIsAivaPromptOpen] = useState(false);
 	const [aivaTitle, setAivaTitle] = useState("");
-	const [aivaPromptText, setAivaPromptText] = useState("");
+	const [aivaScriptText, setAivaScriptText] = useState("");
 	const [aivaImageUrlInput, setAivaImageUrlInput] = useState("");
 	const [aivaImages, setAivaImages] = useState([]);
-	const [aivaDuration, setAivaDuration] = useState(10);
 	const [aivaError, setAivaError] = useState(null);
 	const [isAivaWaiting, setIsAivaWaiting] = useState(false);
 	const [aivaProgress, setAivaProgress] = useState(0);
 	const [isResettingUploads, setIsResettingUploads] = useState(false);
+	const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+	const [settingsBusy, setSettingsBusy] = useState(false);
+	const [settingsError, setSettingsError] = useState(null);
+	const [settingsInfo, setSettingsInfo] = useState("");
+	const [settingsNewPhone, setSettingsNewPhone] = useState("");
+	const [settingsPhoneCode, setSettingsPhoneCode] = useState("");
+	const [settingsNewPassword, setSettingsNewPassword] = useState("");
+	const [settingsPasswordCode, setSettingsPasswordCode] = useState("");
+	const [followVersion, setFollowVersion] = useState(0);
+	const [userCommentCountsById, setUserCommentCountsById] = useState({});
+	const [userViewCountsById, setUserViewCountsById] = useState({});
+	const lastViewedPostIdRef = useRef(null);
+	const queueInitializedRef = useRef(false);
+	const lastQueueSearchRef = useRef("");
+	const shouldScrollToTopRef = useRef(false);
 	const aivaPollRef = useRef(null);
 	const aivaProgressTimerRef = useRef(null);
 
@@ -518,6 +625,21 @@ export default function App() {
 		setAuthDebugCode("");
 		await AsyncStorage.removeItem(AUTH_SESSION_STORAGE_KEY);
 	}, []);
+
+	const updateAuthUser = useCallback(
+		async (nextUser) => {
+			if (!authToken || !nextUser) {
+				setAuthUser(nextUser || null);
+				return;
+			}
+			await AsyncStorage.setItem(
+				AUTH_SESSION_STORAGE_KEY,
+				JSON.stringify({ token: authToken, user: nextUser })
+			);
+			setAuthUser(nextUser);
+		},
+		[authToken]
+	);
 
 	useEffect(() => {
 		const hydrateAuth = async () => {
@@ -603,9 +725,20 @@ export default function App() {
 	const addAivaImageUrl = useCallback(() => {
 		const trimmed = aivaImageUrlInput.trim();
 		if (!trimmed) return;
-		setAivaImages([
-			{ id: `${Date.now()}-${Math.random()}`, type: "url", uri: trimmed },
-		]);
+		if (!/^https?:\/\//i.test(trimmed)) {
+			setAivaError("Image URL must start with http:// or https://");
+			return;
+		}
+		setAivaImages((prev) => {
+			if (prev.length >= MAX_AIVA_IMAGES) {
+				setAivaError(`You can add up to ${MAX_AIVA_IMAGES} images.`);
+				return prev;
+			}
+			return [
+				...prev,
+				{ id: `${Date.now()}-${Math.random()}`, type: "url", uri: trimmed },
+			];
+		});
 		setAivaImageUrlInput("");
 	}, [aivaImageUrlInput]);
 
@@ -672,50 +805,68 @@ export default function App() {
 
 		const result = await ImagePicker.launchImageLibraryAsync({
 			mediaTypes: ImagePicker.MediaTypeOptions.Images,
-			allowsEditing: true,
+			allowsEditing: false,
+			allowsMultipleSelection: true,
+			selectionLimit: MAX_AIVA_IMAGES,
 			quality: 0.9,
 		});
 
 		if (result.canceled) return;
-		const asset = result.assets?.[0];
-		if (!asset?.uri) return;
+		const pickedAssets = Array.isArray(result.assets)
+			? result.assets.filter((asset) => asset?.uri)
+			: [];
+		if (!pickedAssets.length) return;
 
-		setAivaImages([
-			{
+		setAivaImages((prev) => {
+			if (prev.length >= MAX_AIVA_IMAGES) {
+				setAivaError(`You can add up to ${MAX_AIVA_IMAGES} images.`);
+				return prev;
+			}
+			const remaining = MAX_AIVA_IMAGES - prev.length;
+			const next = pickedAssets.slice(0, remaining).map((asset) => ({
 				id: `${Date.now()}-${Math.random()}`,
 				type: "local",
 				uri: asset.uri,
 				name: asset.fileName,
 				mimeType: asset.mimeType,
-			},
-		]);
+			}));
+			if (pickedAssets.length > remaining) {
+				setAivaError(`Only the first ${remaining} image(s) were added (max ${MAX_AIVA_IMAGES}).`);
+			}
+			return [...prev, ...next];
+		});
 	}, []);
 
-	const uploadAivaImagesIfNeeded = useCallback(async () => {
-		const img = aivaImages.find((item) => item.type === "local");
-		if (!img) return null;
+	const prepareAivaImageUrls = useCallback(async () => {
+		const uploadedById = {};
+		for (const img of aivaImages) {
+			if (img.type !== "local") continue;
+			const name = img.name || img.uri.split("/").pop();
+			const type = img.mimeType || "image/jpeg";
+			const formData = new FormData();
+			formData.append("image", {
+				uri: img.uri,
+				name: name || "aiva.jpg",
+				type,
+			});
 
-		const name = img.name || img.uri.split("/").pop();
-		const type = img.mimeType || "image/jpeg";
-
-		const formData = new FormData();
-		formData.append("image", {
-			uri: img.uri,
-			name: name || "aiva.jpg",
-			type,
-		});
-
-		const response = await apiFetch("/aiva/prompt-image", {
-			method: "POST",
-			body: formData,
-		});
-
-		if (!response.ok) {
-			throw new Error(`Image upload failed (${response.status})`);
+			const response = await apiFetch("/aiva/prompt-image", {
+				method: "POST",
+				body: formData,
+			});
+			if (!response.ok) {
+				throw new Error(`Image upload failed (${response.status})`);
+			}
+			const data = await response.json();
+			if (!data?.imageUrl) {
+				throw new Error("Image upload did not return a usable URL.");
+			}
+			uploadedById[img.id] = data.imageUrl;
 		}
 
-		const data = await response.json();
-		return data?.imageUrl || null;
+		return aivaImages
+			.map((img) => (img.type === "url" ? img.uri : uploadedById[img.id]))
+			.filter(Boolean);
 	}, [aivaImages, apiFetch]);
 
 	const handleGenerateAiva = useCallback(async () => {
@@ -729,21 +880,21 @@ export default function App() {
 			if (!trimmedTitle) {
 				throw new Error("Title is required.");
 			}
-
-			const selectedImage = aivaImages[0];
-			if (!selectedImage) {
-				throw new Error("Provide one image (URL or photo).");
+			const trimmedScript = aivaScriptText.trim();
+			if (!trimmedScript) {
+				throw new Error("Script is required.");
 			}
 
-			let finalImageUrl = null;
-			if (selectedImage.type === "url") {
-				finalImageUrl = selectedImage.uri;
-			} else {
-				finalImageUrl = await uploadAivaImagesIfNeeded();
+			if (!aivaImages.length) {
+				throw new Error("Provide at least one image.");
+			}
+			if (aivaImages.length > MAX_AIVA_IMAGES) {
+				throw new Error(`Use at most ${MAX_AIVA_IMAGES} images.`);
 			}
 
-			if (!finalImageUrl) {
-				throw new Error("Could not prepare image for generation.");
+			const finalImageUrls = await prepareAivaImageUrls();
+			if (!finalImageUrls.length) {
+				throw new Error("Could not prepare images for generation.");
 			}
 
 			setIsAivaWaiting(true);
@@ -753,9 +904,8 @@ export default function App() {
 				body: JSON.stringify({
 					userId: currentUserId,
 					title: trimmedTitle,
-					promptText: aivaPromptText.trim(),
-					imageUrls: [finalImageUrl],
-					duration: Number(aivaDuration),
+					promptText: trimmedScript,
+					imageUrls: finalImageUrls,
 				}),
 			});
 			if (!response.ok) {
@@ -763,25 +913,27 @@ export default function App() {
 				throw new Error(body?.error || `AIVA request failed (${response.status})`);
 			}
 			startAivaPolling();
-			setAivaTitle("");
 			setIsAivaPromptOpen(false);
 		} catch (error) {
 			setIsAivaWaiting(false);
 			setAivaProgress(0);
+			setAivaTitle("");
+			setAivaScriptText("");
+			setAivaImageUrlInput("");
+			setAivaImages([]);
 			setAivaError(error?.message ?? "AIVA generation failed.");
 			console.warn("AIVA generation failed:", error);
 		} finally {
 			setIsGeneratingAiva(false);
 		}
 	}, [
-		aivaDuration,
 		aivaImages,
-		aivaPromptText,
+		aivaScriptText,
 		aivaTitle,
 		apiFetch,
 		currentUserId,
 		isGeneratingAiva,
-		uploadAivaImagesIfNeeded,
+		prepareAivaImageUrls,
 	]);
 
 	const handleResetUploadCount = useCallback(async () => {
@@ -922,6 +1074,144 @@ export default function App() {
 		await clearAuthSession();
 	}, [apiFetch, clearAuthSession]);
 
+	const handlePickProfilePhoto = useCallback(async () => {
+		const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+		if (permission.status !== "granted") {
+			setSettingsError("Photo access is required to pick a profile photo.");
+			return;
+		}
+		const result = await ImagePicker.launchImageLibraryAsync({
+			mediaTypes: ImagePicker.MediaTypeOptions.Images,
+			allowsEditing: true,
+			quality: 0.9,
+		});
+		if (result.canceled) return;
+		const asset = result.assets?.[0];
+		if (!asset?.uri) return;
+
+		const formData = new FormData();
+		formData.append("image", {
+			uri: asset.uri,
+			name: asset.fileName || "profile.jpg",
+			type: asset.mimeType || "image/jpeg",
+		});
+
+		try {
+			setSettingsError(null);
+			const response = await apiFetch("/auth/profile-photo", {
+				method: "POST",
+				body: formData,
+			});
+			const body = await response.json().catch(() => ({}));
+			if (!response.ok) {
+				throw new Error(body?.error || `Upload failed (${response.status})`);
+			}
+			await updateAuthUser(body?.user || null);
+		} catch (error) {
+			setSettingsError(error?.message ?? "Failed to upload profile photo.");
+		}
+	}, [apiFetch, updateAuthUser]);
+
+	const handleStartPhoneChange = useCallback(async () => {
+		if (settingsBusy) return;
+		setSettingsBusy(true);
+		setSettingsError(null);
+		setSettingsInfo("");
+		try {
+			const response = await apiFetch("/auth/change-phone/start", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ newPhone: settingsNewPhone.trim() }),
+			});
+			const body = await response.json().catch(() => ({}));
+			if (!response.ok) {
+				throw new Error(body?.error || `Phone change failed (${response.status})`);
+			}
+			setSettingsInfo("Verification code sent to your current phone.");
+		} catch (error) {
+			setSettingsError(error?.message ?? "Failed to start phone change.");
+		} finally {
+			setSettingsBusy(false);
+		}
+	}, [apiFetch, settingsBusy, settingsNewPhone]);
+
+	const handleVerifyPhoneChange = useCallback(async () => {
+		if (settingsBusy) return;
+		setSettingsBusy(true);
+		setSettingsError(null);
+		setSettingsInfo("");
+		try {
+			const response = await apiFetch("/auth/change-phone/verify", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ code: settingsPhoneCode.trim() }),
+			});
+			const body = await response.json().catch(() => ({}));
+			if (!response.ok) {
+				throw new Error(body?.error || `Phone verify failed (${response.status})`);
+			}
+			setIsSettingsOpen(false);
+			await clearAuthSession();
+		} catch (error) {
+			setSettingsError(error?.message ?? "Failed to verify phone change.");
+		} finally {
+			setSettingsBusy(false);
+		}
+	}, [apiFetch, clearAuthSession, settingsBusy, settingsPhoneCode]);
+
+	const handleStartPasswordChange = useCallback(async () => {
+		if (settingsBusy) return;
+		setSettingsBusy(true);
+		setSettingsError(null);
+		setSettingsInfo("");
+		try {
+			const response = await apiFetch("/auth/change-password/start", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ newPassword: settingsNewPassword }),
+			});
+			const body = await response.json().catch(() => ({}));
+			if (!response.ok) {
+				throw new Error(body?.error || `Password change failed (${response.status})`);
+			}
+			setSettingsInfo("Verification code sent to your current phone.");
+		} catch (error) {
+			setSettingsError(error?.message ?? "Failed to start password change.");
+		} finally {
+			setSettingsBusy(false);
+		}
+	}, [apiFetch, settingsBusy, settingsNewPassword]);
+
+	const handleVerifyPasswordChange = useCallback(async () => {
+		if (settingsBusy) return;
+		setSettingsBusy(true);
+		setSettingsError(null);
+		setSettingsInfo("");
+		try {
+			const response = await apiFetch("/auth/change-password/verify", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ code: settingsPasswordCode.trim() }),
+			});
+			const body = await response.json().catch(() => ({}));
+			if (!response.ok) {
+				throw new Error(body?.error || `Password verify failed (${response.status})`);
+			}
+			setSettingsNewPhone("");
+			setSettingsPhoneCode("");
+			setSettingsNewPassword("");
+			setSettingsPasswordCode("");
+			setSettingsError(null);
+			setSettingsInfo("");
+			setIsSettingsOpen(false);
+			await clearAuthSession();
+		} catch (error) {
+			setSettingsError(error?.message ?? "Failed to verify password change.");
+		} finally {
+			setSettingsBusy(false);
+		}
+	}, [apiFetch, clearAuthSession, settingsBusy, settingsPasswordCode]);
+
 	// Toggle like: increment if not liked, decrement if liked.
 	const toggleLikeById = useCallback((postId) => {
 		setFeed((prev) =>
@@ -951,6 +1241,7 @@ export default function App() {
 			next.add(username);
 		}
 		followedUsersRef.current = next;
+		setFollowVersion((v) => v + 1);
 	}, []);
 
 	// Consider an item active once most of it is visible.
@@ -964,7 +1255,15 @@ export default function App() {
 	// Track the topmost visible item index.
 	const onViewableItemsChanged = useRef(({ viewableItems }) => {
 		if (!viewableItems.length) return;
-		setActiveIndex(viewableItems[0].index);
+		const top = viewableItems[0];
+		setActiveIndex(top.index);
+		const postId = top?.item?.id;
+		if (!postId || lastViewedPostIdRef.current === postId) return;
+		lastViewedPostIdRef.current = postId;
+		setUserViewCountsById((prev) => ({
+			...prev,
+			[postId]: (prev[postId] || 0) + 1,
+		}));
 	}).current;
 
 	// Comments sheet state.
@@ -1014,33 +1313,116 @@ export default function App() {
 					};
 				})
 			);
+			setUserCommentCountsById((prev) => ({
+				...prev,
+				[commentsPostId]: (prev[commentsPostId] || 0) + 1,
+			}));
 		},
 		[commentsPostId, setFeed]
 	);
 
-	const filteredFeed = useMemo(() => {
+	const candidateFeed = useMemo(() => {
 		const baseFeed =
 			feedFilter === "user"
 				? feed.filter((post) => post.username === currentUser)
-				: feed;
-		const matches = getSearchMatchesInOrder(baseFeed, searchQuery);
-		if (!matches.length) return matches;
-
-		const followed = matches.filter((post) =>
-			followedUsersRef.current.has(post.username)
-		);
-		const others = matches.filter(
-			(post) => !followedUsersRef.current.has(post.username)
-		);
-		return [...followed, ...others];
+				: feed.filter((post) => post.username !== currentUser);
+		return getSearchMatchesInOrder(baseFeed, searchQuery);
 	}, [feed, feedFilter, searchQuery, currentUser]);
+	const candidateIdsKey = useMemo(
+		() => candidateFeed.map((post) => post.id).join("|"),
+		[candidateFeed]
+	);
+
+	const [recommendedIds, setRecommendedIds] = useState([]);
+
+	const pickNextRecommendedId = (excludedIds) => {
+		if (!candidateFeed.length) return null;
+		const excluded = new Set(excludedIds);
+		const ranked = rankFeedItems({
+			items: candidateFeed,
+			followedUsers: followedUsersRef.current,
+			userCommentCountsById,
+			userViewCountsById,
+		});
+		const next = ranked.find((post) => !excluded.has(post.id));
+		return next?.id || null;
+	};
+
+	const ensureRecommendationBuffer = (existingIds, minLength) => {
+		if (!candidateFeed.length) return [];
+		const seen = new Set();
+		const validIds = existingIds.filter((id) => {
+			if (seen.has(id)) return false;
+			seen.add(id);
+			return candidateFeed.some((post) => post.id === id);
+		});
+		const targetLength = Math.min(candidateFeed.length, Math.max(0, minLength));
+		const nextIds = [...validIds];
+		while (nextIds.length < targetLength) {
+			const nextId = pickNextRecommendedId(nextIds);
+			if (!nextId) break;
+			nextIds.push(nextId);
+		}
+		return nextIds;
+	};
 
 	useEffect(() => {
+		const normalizedSearch = searchQuery.trim().toLowerCase();
+		const searchChanged = normalizedSearch !== lastQueueSearchRef.current;
+		const shouldRebuild = !queueInitializedRef.current || searchChanged;
+		if (!shouldRebuild) return;
+		if (!candidateFeed.length) return;
+
+		setRecommendedIds(
+			ensureRecommendationBuffer([], Math.min(3, candidateFeed.length))
+		);
 		setActiveIndex(0);
-		if (filteredFeed.length > 0) {
+		shouldScrollToTopRef.current = true;
+		queueInitializedRef.current = true;
+		lastQueueSearchRef.current = normalizedSearch;
+	}, [candidateIdsKey, candidateFeed.length, searchQuery]);
+
+	useEffect(() => {
+		if (!candidateFeed.length) return;
+		setRecommendedIds((prev) =>
+			ensureRecommendationBuffer(
+				prev,
+				Math.min(candidateFeed.length, activeIndex + 3)
+			)
+		);
+	}, [activeIndex, candidateFeed.length, followVersion, userCommentCountsById, userViewCountsById]);
+
+	useEffect(() => {
+		if (!candidateFeed.length) return;
+		setRecommendedIds((prev) =>
+			prev.filter((id) =>
+			candidateFeed.some((post) => post.id === id)
+			)
+		);
+	}, [candidateIdsKey, candidateFeed.length]);
+
+	const filteredFeed = useMemo(() => {
+		if (!recommendedIds.length) return [];
+		const byId = new Map(candidateFeed.map((post) => [post.id, post]));
+		const ordered = recommendedIds.map((id) => byId.get(id)).filter(Boolean);
+		const seen = new Set();
+		return ordered.filter((post) => {
+			if (seen.has(post.id)) return false;
+			seen.add(post.id);
+			return true;
+		});
+	}, [candidateFeed, recommendedIds]);
+
+	useEffect(() => {
+		if (!shouldScrollToTopRef.current) return;
+		if (!filteredFeed.length) return;
+		try {
 			feedListRef.current?.scrollToIndex({ index: 0, animated: false });
+		} catch {
+			// FlatList may not be ready on the first frame.
 		}
-	}, [searchQuery, feedFilter, filteredFeed.length]);
+		shouldScrollToTopRef.current = false;
+	}, [filteredFeed.length]);
 
 	useEffect(() => {
 		if (!filteredFeed.length) {
@@ -1240,16 +1622,20 @@ export default function App() {
 							placeholderTextColor="rgba(255,255,255,0.5)"
 							style={styles.aivaModalInput}
 						/>
-						<Text style={styles.aivaModalLabel}>Prompt text</Text>
+						<Text style={styles.aivaModalLabel}>Script</Text>
 						<TextInput
-							value={aivaPromptText}
-							onChangeText={setAivaPromptText}
-							placeholder="Describe the scene..."
+							value={aivaScriptText}
+							onChangeText={setAivaScriptText}
+							placeholder="Write the story or narration direction..."
 							placeholderTextColor="rgba(255,255,255,0.5)"
 							multiline
 							style={styles.aivaModalInput}
 						/>
-						<Text style={styles.aivaModalLabel}>Prompt image (1 only)</Text>
+						<Text style={styles.aivaHintText}>
+							Upload up to {MAX_AIVA_IMAGES} images. The final video uses {AIVA_SECONDS_PER_IMAGE}s per image
+							with ElevenLabs narration over your script.
+						</Text>
+						<Text style={styles.aivaModalLabel}>Images (up to {MAX_AIVA_IMAGES})</Text>
 						<View style={styles.aivaUrlRow}>
 							<TextInput
 								value={aivaImageUrlInput}
@@ -1279,49 +1665,28 @@ export default function App() {
 								</Text>
 							</TouchableOpacity>
 							<Text style={styles.aivaCountText}>
-								{aivaImages.length ? "1 selected" : "0 selected"}
+								{aivaImages.length} selected
 							</Text>
 						</View>
 						{aivaImages.length > 0 && (
 							<View style={styles.aivaPreviewRow}>
-								<View key={aivaImages[0].id} style={styles.aivaPreviewItem}>
-									<Image source={{ uri: aivaImages[0].uri }} style={styles.aivaPreview} />
-									<TouchableOpacity
-										onPress={() => removeAivaImage(aivaImages[0].id)}
-										activeOpacity={0.8}
-										style={styles.aivaRemoveButton}
-									>
-										<Text style={styles.aivaRemoveText}>✕</Text>
-									</TouchableOpacity>
-								</View>
+								{aivaImages.map((img) => (
+									<View key={img.id} style={styles.aivaPreviewItem}>
+										<Image source={{ uri: img.uri }} style={styles.aivaPreview} />
+										<TouchableOpacity
+											onPress={() => removeAivaImage(img.id)}
+											activeOpacity={0.8}
+											style={styles.aivaRemoveButton}
+										>
+											<Text style={styles.aivaRemoveText}>✕</Text>
+										</TouchableOpacity>
+									</View>
+								))}
 							</View>
 						)}
 						<Text style={styles.aivaHintText}>
-							Adding a new image replaces the current image.
+							Use up to {MAX_AIVA_IMAGES} images. At {AIVA_SECONDS_PER_IMAGE}s each, 12 images make ~1 minute.
 						</Text>
-						<Text style={styles.aivaModalLabel}>Duration</Text>
-						<View style={styles.aivaDurationRow}>
-							<TouchableOpacity
-								onPress={() => setAivaDuration(5)}
-								activeOpacity={0.9}
-								style={[
-									styles.aivaDurationButton,
-									aivaDuration === 5 && styles.aivaDurationButtonActive,
-								]}
-							>
-								<Text style={styles.aivaDurationText}>5s</Text>
-							</TouchableOpacity>
-							<TouchableOpacity
-								onPress={() => setAivaDuration(10)}
-								activeOpacity={0.9}
-								style={[
-									styles.aivaDurationButton,
-									aivaDuration === 10 && styles.aivaDurationButtonActive,
-								]}
-							>
-								<Text style={styles.aivaDurationText}>10s</Text>
-							</TouchableOpacity>
-						</View>
 						{aivaError ? (
 							<Text style={styles.aivaErrorText}>{aivaError}</Text>
 						) : null}
@@ -1348,6 +1713,120 @@ export default function App() {
 								</Text>
 							</TouchableOpacity>
 						</View>
+					</View>
+				</View>
+			</Modal>
+			<Modal
+				transparent
+				visible={isSettingsOpen}
+				animationType="fade"
+				onRequestClose={() => setIsSettingsOpen(false)}
+			>
+				<View style={styles.aivaModalBackdrop}>
+					<View style={styles.aivaModalCard}>
+						<Text style={styles.aivaModalTitle}>Settings</Text>
+						<Text style={styles.aivaModalLabel}>Change phone number</Text>
+						<TextInput
+							value={settingsNewPhone}
+							onChangeText={setSettingsNewPhone}
+							placeholder="+15551234567"
+							placeholderTextColor="rgba(255,255,255,0.5)"
+							autoCapitalize="none"
+							autoCorrect={false}
+							keyboardType="phone-pad"
+							style={styles.aivaModalInput}
+						/>
+						<View style={styles.aivaModalActions}>
+							<TouchableOpacity
+								onPress={handleStartPhoneChange}
+								disabled={settingsBusy}
+								activeOpacity={0.9}
+								style={[styles.aivaModalButton, styles.aivaModalButtonPrimary]}
+							>
+								<Text style={styles.aivaModalButtonText}>Send Code</Text>
+							</TouchableOpacity>
+						</View>
+						<TextInput
+							value={settingsPhoneCode}
+							onChangeText={setSettingsPhoneCode}
+							placeholder="Enter verification code"
+							placeholderTextColor="rgba(255,255,255,0.5)"
+							keyboardType="number-pad"
+							style={styles.aivaModalInput}
+						/>
+						<View style={styles.aivaModalActions}>
+							<TouchableOpacity
+								onPress={handleVerifyPhoneChange}
+								disabled={settingsBusy}
+								activeOpacity={0.9}
+								style={[styles.aivaModalButton, styles.aivaModalButtonPrimary]}
+							>
+								<Text style={styles.aivaModalButtonText}>Verify Phone</Text>
+							</TouchableOpacity>
+						</View>
+
+						<Text style={styles.aivaModalLabel}>Change password</Text>
+						<TextInput
+							value={settingsNewPassword}
+							onChangeText={setSettingsNewPassword}
+							placeholder="New password"
+							placeholderTextColor="rgba(255,255,255,0.5)"
+							secureTextEntry
+							style={styles.aivaModalInput}
+						/>
+						<View style={styles.aivaModalActions}>
+							<TouchableOpacity
+								onPress={handleStartPasswordChange}
+								disabled={settingsBusy}
+								activeOpacity={0.9}
+								style={[styles.aivaModalButton, styles.aivaModalButtonPrimary]}
+							>
+								<Text style={styles.aivaModalButtonText}>Send Code</Text>
+							</TouchableOpacity>
+						</View>
+						<TextInput
+							value={settingsPasswordCode}
+							onChangeText={setSettingsPasswordCode}
+							placeholder="Enter verification code"
+							placeholderTextColor="rgba(255,255,255,0.5)"
+							keyboardType="number-pad"
+							style={styles.aivaModalInput}
+						/>
+						<View style={styles.aivaModalActions}>
+							<TouchableOpacity
+								onPress={handleVerifyPasswordChange}
+								disabled={settingsBusy}
+								activeOpacity={0.9}
+								style={[styles.aivaModalButton, styles.aivaModalButtonPrimary]}
+							>
+								<Text style={styles.aivaModalButtonText}>Verify Password</Text>
+							</TouchableOpacity>
+						</View>
+
+						{settingsInfo ? (
+							<Text style={styles.authDevCode}>{settingsInfo}</Text>
+						) : null}
+						{settingsError ? (
+							<Text style={styles.aivaErrorText}>{settingsError}</Text>
+						) : null}
+
+						<View style={styles.aivaModalActions}>
+							<TouchableOpacity
+								onPress={() => setIsSettingsOpen(false)}
+								activeOpacity={0.9}
+								style={styles.aivaModalButton}
+							>
+								<Text style={styles.aivaModalButtonText}>Close</Text>
+							</TouchableOpacity>
+						</View>
+						<TouchableOpacity
+							onPress={handleLogout}
+							disabled={settingsBusy}
+							activeOpacity={0.9}
+							style={[styles.aivaModalButton, styles.settingsLogoutButton]}
+						>
+							<Text style={styles.aivaModalButtonText}>Logout</Text>
+						</TouchableOpacity>
 					</View>
 				</View>
 			</Modal>
@@ -1397,16 +1876,35 @@ export default function App() {
 											<Text style={styles.aivaSettingsIcon}>✨</Text>
 										</TouchableOpacity>
 										<TouchableOpacity
-											onPress={handleLogout}
+											onPress={() => {
+												setSettingsError(null);
+												setSettingsInfo("");
+												setIsSettingsOpen(true);
+											}}
 											hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
 											style={styles.settingsButton}
 										>
-											<Text style={styles.settingsIcon}>⎋</Text>
+											<Text style={styles.settingsIcon}>⚙</Text>
 										</TouchableOpacity>
 									</View>
 								</View>
 								<View style={styles.profileHeader}>
-									<View style={styles.profileAvatar} />
+									<TouchableOpacity
+										onPress={handlePickProfilePhoto}
+										activeOpacity={0.9}
+										style={styles.profileAvatar}
+									>
+										{currentUserProfilePicture ? (
+											<Image
+												source={{ uri: currentUserProfilePicture }}
+												style={styles.profileAvatarImage}
+											/>
+										) : (
+											<Text style={styles.profileAvatarText}>
+												{(currentUser?.[0] || "?").toUpperCase()}
+											</Text>
+										)}
+									</TouchableOpacity>
 									<Text style={styles.profileUsername}>@{currentUser}</Text>
 									{currentUser === "andrew" ? (
 										<TouchableOpacity
@@ -1972,6 +2470,12 @@ const styles = StyleSheet.create({
 	aivaModalButtonPrimary: {
 		backgroundColor: "#2f83ff",
 	},
+	settingsLogoutButton: {
+		marginTop: 10,
+		alignSelf: "stretch",
+		alignItems: "center",
+		backgroundColor: "#ff4d5e",
+	},
 	aivaModalButtonDisabled: {
 		opacity: 0.6,
 	},
@@ -2109,6 +2613,18 @@ const styles = StyleSheet.create({
 		height: 88,
 		borderRadius: 44,
 		backgroundColor: "rgba(255,255,255,0.2)",
+		alignItems: "center",
+		justifyContent: "center",
+		overflow: "hidden",
+	},
+	profileAvatarImage: {
+		width: "100%",
+		height: "100%",
+	},
+	profileAvatarText: {
+		color: "white",
+		fontSize: 30,
+		fontWeight: "800",
 	},
 	profileUsername: {
 		color: "white",
