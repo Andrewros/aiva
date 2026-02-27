@@ -1,4 +1,6 @@
-require("dotenv").config();
+if (process.env.NODE_ENV !== "production") {
+  require("dotenv").config();
+}
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -12,6 +14,7 @@ const multer = require("multer");
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.get("/health", (_req, res) => res.send("ok"));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -99,10 +102,19 @@ const AIVA_PROMPT_IMAGE_URL = process.env.AIVA_PROMPT_IMAGE_URL;
 const AIVA_PROMPT_TEXT =
   process.env.AIVA_PROMPT_TEXT ||
   "A cinematic, futuristic neon city skyline at dusk, dramatic lighting";
+const AIVA_BASE_VIDEO_LIMIT = 3;
+const AIVA_MAX_VIDEO_LIMIT = 100;
+const AIVA_ADS_PER_REWARDED_VIDEO = 10;
 const AUTH_OTP_TTL_MS = Number(process.env.AUTH_OTP_TTL_MS || 5 * 60 * 1000);
 const AUTH_SESSION_TTL_MS = Number(
   process.env.AUTH_SESSION_TTL_MS || 30 * 24 * 60 * 60 * 1000
 );
+
+function resolveAivaVideoLimit(row) {
+  const bonus = Number(row?.aiva_bonus_videos ?? 0);
+  const safeBonus = Number.isFinite(bonus) ? Math.max(0, Math.floor(bonus)) : 0;
+  return Math.min(AIVA_MAX_VIDEO_LIMIT, AIVA_BASE_VIDEO_LIMIT + safeBonus);
+}
 
 function normalizePhone(value) {
   const digits = String(value || "").replace(/[^\d+]/g, "").trim();
@@ -389,7 +401,17 @@ function getPublicBaseUrl(req) {
 function toAbsoluteAssetUrl(value, baseUrl) {
   const text = String(value || "");
   if (!text) return text;
-  if (/^https?:\/\//i.test(text)) return text;
+  if (/^https?:\/\//i.test(text)) {
+    try {
+      const parsed = new URL(text);
+      if (parsed.pathname.startsWith("/uploads/")) {
+        return `${baseUrl}${parsed.pathname}`;
+      }
+    } catch {
+      // Keep original value when URL parsing fails.
+    }
+    return text;
+  }
   if (text.startsWith("/")) return `${baseUrl}${text}`;
   return text;
 }
@@ -881,13 +903,25 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       username TEXT NOT NULL,
-      aiva_video_count INTEGER NOT NULL DEFAULT 0
+      aiva_video_count INTEGER NOT NULL DEFAULT 0,
+      aiva_bonus_videos INTEGER NOT NULL DEFAULT 0,
+      aiva_reward_ad_views INTEGER NOT NULL DEFAULT 0
     );
   `);
 
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS aiva_video_count INTEGER NOT NULL DEFAULT 0;
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS aiva_bonus_videos INTEGER NOT NULL DEFAULT 0;
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS aiva_reward_ad_views INTEGER NOT NULL DEFAULT 0;
   `);
 
   await pool.query(`
@@ -978,6 +1012,50 @@ async function initDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS feed_item_likes (
+      feed_item_id TEXT NOT NULL REFERENCES feed_items(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (feed_item_id, user_id)
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS feed_item_likes_user_idx
+    ON feed_item_likes (user_id, created_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS feed_item_views (
+      feed_item_id TEXT NOT NULL REFERENCES feed_items(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      view_count INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (feed_item_id, user_id)
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS feed_item_views_user_idx
+    ON feed_item_views (user_id, last_viewed_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_following (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      username TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, username)
+    );
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS user_following_user_username_lower_unique
+    ON user_following (user_id, LOWER(username));
+  `);
 }
 
 async function seedFeedIfEmpty() {
@@ -1020,11 +1098,15 @@ function mapFeedRow(row, baseUrl) {
     username: row.username,
     caption: row.caption,
     audio: row.audio,
+    createdAt: row.created_at,
     uri: toAbsoluteAssetUrl(row.uri, baseUrl),
     poster: toAbsoluteAssetUrl(row.poster, baseUrl),
     likes: row.likes,
     comments: row.comments ?? [],
     commentsCount: row.comments_count ?? 0,
+    isLiked: Boolean(row.is_liked),
+    hasSeen: Boolean(row.has_seen),
+    userViewCount: Number(row.user_view_count || 0),
   };
 }
 
@@ -1279,7 +1361,7 @@ async function ensureAivaVideoForUser(userId, options = {}) {
   const caption = requestedTitle || "Untitled AIVA video";
 
   const { rows } = await pool.query(
-    "SELECT username, aiva_video_count FROM users WHERE id = $1",
+    "SELECT username, aiva_video_count, aiva_bonus_videos FROM users WHERE id = $1",
     [userId]
   );
   if (!rows[0]) {
@@ -1287,7 +1369,8 @@ async function ensureAivaVideoForUser(userId, options = {}) {
   }
   const username = rows[0].username;
   const count = rows[0]?.aiva_video_count ?? 0;
-  if (count >= 3) {
+  const limit = resolveAivaVideoLimit(rows[0]);
+  if (count >= limit) {
     return { alreadyGenerated: true, remaining: 0, count };
   }
 
@@ -1318,7 +1401,7 @@ async function ensureAivaVideoForUser(userId, options = {}) {
 
   return {
     alreadyGenerated: false,
-    remaining: Math.max(0, 2 - count),
+    remaining: Math.max(0, limit - (count + 1)),
     count: count + 1,
   };
 }
@@ -1754,8 +1837,7 @@ app.post("/auth/profile-photo", requireAuth, upload.single("image"), async (req,
   }
 
   try {
-    const baseUrl = getPublicBaseUrl(req);
-    const profilePicture = `${baseUrl}/uploads/${req.file.filename}`;
+    const profilePicture = `/uploads/${req.file.filename}`;
     const { rows } = await pool.query(
       `
         UPDATE users
@@ -1768,7 +1850,7 @@ app.post("/auth/profile-photo", requireAuth, upload.single("image"), async (req,
     if (!rows[0]) {
       return res.status(404).json({ error: "User not found" });
     }
-    return res.json({ ok: true, user: mapUserRow(rows[0], baseUrl) });
+    return res.json({ ok: true, user: mapUserRow(rows[0], getRequestBaseUrl(req)) });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ error: "Failed to upload profile photo" });
@@ -1835,15 +1917,17 @@ app.post("/aiva/generate", requireAuth, async (req, res) => {
     }
 
     const { rows } = await pool.query(
-      "SELECT aiva_video_count FROM users WHERE id = $1",
+      "SELECT aiva_video_count, aiva_bonus_videos FROM users WHERE id = $1",
       [userId]
     );
     const count = rows[0]?.aiva_video_count ?? 0;
-    if (count >= 3) {
+    const limit = resolveAivaVideoLimit(rows[0]);
+    if (count >= limit) {
       return res.status(403).json({
         ok: false,
         error: "AIVA limit reached",
         count,
+        limit,
         remaining: 0,
       });
     }
@@ -1880,7 +1964,10 @@ app.get("/aiva/status", requireAuth, async (req, res) => {
 
   try {
     const [{ rows: users }, { rows: jobs }] = await Promise.all([
-      pool.query("SELECT aiva_video_count FROM users WHERE id = $1", [userId]),
+      pool.query(
+        "SELECT aiva_video_count, aiva_bonus_videos, aiva_reward_ad_views FROM users WHERE id = $1",
+        [userId]
+      ),
       pool.query(
         `
           SELECT *
@@ -1893,14 +1980,114 @@ app.get("/aiva/status", requireAuth, async (req, res) => {
       ),
     ]);
 
+    const count = Number(users[0]?.aiva_video_count ?? 0);
+    const limit = resolveAivaVideoLimit(users[0]);
+    const rewardAdViews = Number(users[0]?.aiva_reward_ad_views ?? 0);
+    const safeRewardAdViews = Number.isFinite(rewardAdViews)
+      ? Math.max(0, Math.floor(rewardAdViews))
+      : 0;
+    const adsTowardNextReward = safeRewardAdViews % AIVA_ADS_PER_REWARDED_VIDEO;
+    const adsRemainingForReward =
+      AIVA_ADS_PER_REWARDED_VIDEO - adsTowardNextReward;
+
     return res.json({
       ok: true,
-      count: users[0]?.aiva_video_count ?? 0,
+      count,
+      limit,
+      remaining: Math.max(0, limit - count),
+      rewardAdViews: safeRewardAdViews,
+      adsTowardNextReward,
+      adsRemainingForReward,
       job: jobs[0] || null,
     });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ error: "Failed to load status" });
+  }
+});
+
+app.post("/aiva/reward-ad-view", requireAuth, async (req, res) => {
+  const userId = req.authUser.id;
+  if (!userId) {
+    return res.status(400).json({ error: "userId is required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `
+        SELECT
+          aiva_video_count,
+          aiva_bonus_videos,
+          aiva_reward_ad_views
+        FROM users
+        WHERE id = $1
+        FOR UPDATE
+      `,
+      [userId]
+    );
+    if (!rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const currentAdViews = Number(rows[0]?.aiva_reward_ad_views ?? 0);
+    const nextAdViews = Math.max(0, Math.floor(currentAdViews)) + 1;
+    const currentBonus = Number(rows[0]?.aiva_bonus_videos ?? 0);
+    let nextBonus = Math.max(0, Math.floor(Number.isFinite(currentBonus) ? currentBonus : 0));
+    let grantedVideo = false;
+
+    const currentLimit = resolveAivaVideoLimit(rows[0]);
+    if (
+      nextAdViews % AIVA_ADS_PER_REWARDED_VIDEO === 0 &&
+      currentLimit < AIVA_MAX_VIDEO_LIMIT
+    ) {
+      nextBonus += 1;
+      grantedVideo = true;
+    }
+
+    const update = await client.query(
+      `
+        UPDATE users
+        SET
+          aiva_reward_ad_views = $2,
+          aiva_bonus_videos = $3
+        WHERE id = $1
+        RETURNING aiva_video_count, aiva_bonus_videos, aiva_reward_ad_views
+      `,
+      [userId, nextAdViews, nextBonus]
+    );
+
+    await client.query("COMMIT");
+
+    const row = update.rows[0] || {};
+    const count = Number(row?.aiva_video_count ?? 0);
+    const limit = resolveAivaVideoLimit(row);
+    const rewardAdViews = Number(row?.aiva_reward_ad_views ?? 0);
+    const safeRewardAdViews = Number.isFinite(rewardAdViews)
+      ? Math.max(0, Math.floor(rewardAdViews))
+      : 0;
+    const adsTowardNextReward = safeRewardAdViews % AIVA_ADS_PER_REWARDED_VIDEO;
+    const adsRemainingForReward =
+      AIVA_ADS_PER_REWARDED_VIDEO - adsTowardNextReward;
+
+    return res.json({
+      ok: true,
+      grantedVideo,
+      count,
+      limit,
+      remaining: Math.max(0, limit - count),
+      rewardAdViews: safeRewardAdViews,
+      adsTowardNextReward,
+      adsRemainingForReward,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error(error);
+    return res.status(500).json({ error: "Failed to reward ad view" });
+  } finally {
+    client.release();
   }
 });
 
@@ -1953,6 +2140,390 @@ app.post("/aiva/reset-upload-count", requireAuth, async (req, res) => {
   }
 });
 
+app.get("/following", requireAuth, async (req, res) => {
+  const userId = String(req.authUser?.id || "").trim();
+  if (!userId) {
+    return res.status(400).json({ error: "userId is required" });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `
+        SELECT username
+        FROM user_following
+        WHERE user_id = $1
+        ORDER BY LOWER(username) ASC
+      `,
+      [userId]
+    );
+    return res.json({
+      ok: true,
+      usernames: rows
+        .map((row) => String(row.username || "").trim())
+        .filter(Boolean),
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Failed to load following" });
+  }
+});
+
+app.post("/following/:username", requireAuth, async (req, res) => {
+  const userId = String(req.authUser?.id || "").trim();
+  const requesterUsername = String(req.authUser?.username || "").trim();
+  const targetUsername = String(req.params?.username || "").trim();
+  const following = Boolean(req.body?.following);
+
+  if (!userId) {
+    return res.status(400).json({ error: "userId is required" });
+  }
+  if (!targetUsername) {
+    return res.status(400).json({ error: "username is required" });
+  }
+  if (requesterUsername && requesterUsername.toLowerCase() === targetUsername.toLowerCase()) {
+    return res.status(400).json({ error: "Cannot follow yourself" });
+  }
+
+  try {
+    if (following) {
+      await pool.query(
+        `
+          INSERT INTO user_following (user_id, username)
+          SELECT $1, $2
+          WHERE NOT EXISTS (
+            SELECT 1
+            FROM user_following
+            WHERE user_id = $1
+              AND LOWER(username) = LOWER($2)
+          )
+        `,
+        [userId, targetUsername]
+      );
+    } else {
+      await pool.query(
+        `
+          DELETE FROM user_following
+          WHERE user_id = $1
+            AND LOWER(username) = LOWER($2)
+        `,
+        [userId, targetUsername]
+      );
+    }
+
+    const { rows } = await pool.query(
+      `
+        SELECT username
+        FROM user_following
+        WHERE user_id = $1
+        ORDER BY LOWER(username) ASC
+      `,
+      [userId]
+    );
+
+    return res.json({
+      ok: true,
+      following,
+      usernames: rows
+        .map((row) => String(row.username || "").trim())
+        .filter(Boolean),
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Failed to update following" });
+  }
+});
+
+app.post("/feed/:id/like", requireAuth, async (req, res) => {
+  const postId = String(req.params?.id || "").trim();
+  const userId = req.authUser?.id;
+  const liked = Boolean(req.body?.liked);
+
+  if (!postId) {
+    return res.status(400).json({ error: "post id is required" });
+  }
+  if (!userId) {
+    return res.status(400).json({ error: "userId is required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const itemCheck = await client.query(
+      "SELECT id FROM feed_items WHERE id = $1 FOR UPDATE",
+      [postId]
+    );
+    if (!itemCheck.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Feed item not found" });
+    }
+
+    let delta = 0;
+    if (liked) {
+      const insertResult = await client.query(
+        `
+          INSERT INTO feed_item_likes (feed_item_id, user_id)
+          VALUES ($1, $2)
+          ON CONFLICT (feed_item_id, user_id) DO NOTHING
+        `,
+        [postId, userId]
+      );
+      delta = insertResult.rowCount > 0 ? 1 : 0;
+    } else {
+      const deleteResult = await client.query(
+        `
+          DELETE FROM feed_item_likes
+          WHERE feed_item_id = $1 AND user_id = $2
+        `,
+        [postId, userId]
+      );
+      delta = deleteResult.rowCount > 0 ? -1 : 0;
+    }
+
+    const update = await client.query(
+      `
+        UPDATE feed_items
+        SET likes = GREATEST(0, likes + $2)
+        WHERE id = $1
+        RETURNING likes
+      `,
+      [postId, delta]
+    );
+    await client.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      id: postId,
+      isLiked: liked,
+      likes: update.rows[0]?.likes ?? 0,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error(error);
+    return res.status(500).json({ error: "Failed to update like" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/feed/:id/comments", requireAuth, async (req, res) => {
+  const postId = String(req.params?.id || "").trim();
+  const user = String(req.authUser?.username || "").trim();
+  const text = String(req.body?.text || "").trim();
+
+  if (!postId) {
+    return res.status(400).json({ error: "post id is required" });
+  }
+  if (!text) {
+    return res.status(400).json({ error: "comment text is required" });
+  }
+  if (text.length > 500) {
+    return res.status(400).json({ error: "comment text must be <= 500 chars" });
+  }
+
+  const comment = {
+    id: crypto.randomUUID(),
+    user: user || "unknown",
+    text,
+    likes: 0,
+    createdAt: new Date().toISOString(),
+  };
+
+  try {
+    const result = await pool.query(
+      `
+        UPDATE feed_items
+        SET
+          comments = jsonb_build_array($2::jsonb) || comments,
+          comments_count = comments_count + 1
+        WHERE id = $1
+        RETURNING comments_count
+      `,
+      [postId, JSON.stringify(comment)]
+    );
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: "Feed item not found" });
+    }
+
+    return res.json({
+      ok: true,
+      id: postId,
+      comment,
+      commentsCount: result.rows[0].comments_count ?? 0,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Failed to add comment" });
+  }
+});
+
+app.post("/feed/:id/view", requireAuth, async (req, res) => {
+  const postId = String(req.params?.id || "").trim();
+  const userId = req.authUser?.id;
+
+  if (!postId) {
+    return res.status(400).json({ error: "post id is required" });
+  }
+  if (!userId) {
+    return res.status(400).json({ error: "userId is required" });
+  }
+
+  try {
+    const itemCheck = await pool.query(
+      "SELECT id FROM feed_items WHERE id = $1 LIMIT 1",
+      [postId]
+    );
+    if (!itemCheck.rows[0]) {
+      return res.status(404).json({ error: "Feed item not found" });
+    }
+
+    const result = await pool.query(
+      `
+        INSERT INTO feed_item_views (feed_item_id, user_id, view_count, last_viewed_at)
+        VALUES ($1, $2, 1, NOW())
+        ON CONFLICT (feed_item_id, user_id) DO UPDATE
+          SET view_count = feed_item_views.view_count + 1,
+              last_viewed_at = NOW()
+        RETURNING view_count, last_viewed_at
+      `,
+      [postId, userId]
+    );
+
+    return res.json({
+      ok: true,
+      id: postId,
+      hasSeen: true,
+      userViewCount: Number(result.rows[0]?.view_count || 0),
+      lastViewedAt: result.rows[0]?.last_viewed_at || null,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Failed to record view" });
+  }
+});
+
+app.delete("/feed/:id", requireAuth, async (req, res) => {
+  const postId = String(req.params?.id || "").trim();
+  const requesterUserId = String(req.authUser?.id || "").trim();
+  const requesterUsername = String(req.authUser?.username || "").trim().toLowerCase();
+
+  if (!postId) {
+    return res.status(400).json({ error: "post id is required" });
+  }
+  if (!requesterUserId || !requesterUsername) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
+    const itemResult = await pool.query(
+      `
+        SELECT id, user_id, username, uri
+        FROM feed_items
+        WHERE id = $1
+        LIMIT 1
+      `,
+      [postId]
+    );
+    const item = itemResult.rows[0];
+    if (!item) {
+      return res.status(404).json({ error: "Feed item not found" });
+    }
+
+    const ownerUserId = String(item.user_id || "").trim();
+    const ownerUsername = String(item.username || "").trim().toLowerCase();
+    const canDelete =
+      requesterUsername === "andrewr" ||
+      (ownerUserId && ownerUserId === requesterUserId) ||
+      ownerUsername === requesterUsername;
+    if (!canDelete) {
+      return res.status(403).json({ error: "Not allowed to delete this video" });
+    }
+
+    await pool.query("DELETE FROM feed_items WHERE id = $1", [postId]);
+
+    const uri = String(item.uri || "").trim();
+    if (uri.startsWith("/uploads/videos/")) {
+      const rel = uri.replace(/^\/+/, "");
+      const abs = path.join(__dirname, rel);
+      if (abs.startsWith(VIDEOS_DIR)) {
+        await fs.promises.unlink(abs).catch(() => {});
+      }
+    }
+
+    return res.json({ ok: true, id: postId });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Failed to delete feed item" });
+  }
+});
+
+app.delete("/channels/:username", requireAuth, async (req, res) => {
+  const requesterUsername = String(req.authUser?.username || "").trim().toLowerCase();
+  const targetUsername = String(req.params?.username || "").trim();
+  if (!targetUsername) {
+    return res.status(400).json({ error: "username is required" });
+  }
+  if (requesterUsername !== "andrewr") {
+    return res.status(403).json({ error: "Only andrewr can delete a channel" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const targetResult = await client.query(
+      `
+        SELECT id, username
+        FROM users
+        WHERE LOWER(username) = LOWER($1)
+        LIMIT 1
+      `,
+      [targetUsername]
+    );
+    const target = targetResult.rows[0];
+    if (!target) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Channel not found" });
+    }
+
+    const deletedVideosResult = await client.query(
+      `
+        DELETE FROM feed_items
+        WHERE user_id = $1 OR LOWER(username) = LOWER($2)
+        RETURNING uri
+      `,
+      [target.id, target.username]
+    );
+
+    await client.query("DELETE FROM auth_sessions WHERE user_id = $1", [target.id]);
+    await client.query("DELETE FROM auth_challenges WHERE user_id = $1", [target.id]);
+    await client.query("DELETE FROM aiva_jobs WHERE user_id = $1", [target.id]);
+    await client.query("DELETE FROM users WHERE id = $1", [target.id]);
+    await client.query("COMMIT");
+
+    const uris = deletedVideosResult.rows.map((row) => String(row.uri || "").trim());
+    for (const uri of uris) {
+      if (!uri.startsWith("/uploads/videos/")) continue;
+      const rel = uri.replace(/^\/+/, "");
+      const abs = path.join(__dirname, rel);
+      if (!abs.startsWith(VIDEOS_DIR)) continue;
+      await fs.promises.unlink(abs).catch(() => {});
+    }
+
+    return res.json({
+      ok: true,
+      username: target.username,
+      deletedVideos: deletedVideosResult.rowCount || 0,
+      deletedChannel: true,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error(error);
+    return res.status(500).json({ error: "Failed to delete channel" });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/feed", async (req, res) => {
   const userId = req.query.userId ? String(req.query.userId) : null;
 
@@ -1962,19 +2533,33 @@ app.get("/feed", async (req, res) => {
 
     if (userId) {
       query = `
-        SELECT *
-        FROM feed_items
+        SELECT
+          f.*,
+          (fil.user_id IS NOT NULL) AS is_liked,
+          (fiv.user_id IS NOT NULL) AS has_seen,
+          COALESCE(fiv.view_count, 0) AS user_view_count
+        FROM feed_items f
+        LEFT JOIN feed_item_likes fil
+          ON fil.feed_item_id = f.id
+          AND fil.user_id = $1
+        LEFT JOIN feed_item_views fiv
+          ON fiv.feed_item_id = f.id
+          AND fiv.user_id = $1
         ORDER BY
-          CASE WHEN user_id = $1 THEN 0 ELSE 1 END,
-          created_at DESC
+          CASE WHEN f.user_id = $1 THEN 0 ELSE 1 END,
+          f.created_at DESC
       `;
       params = [userId];
     } else {
       query = `
-        SELECT *
-        FROM feed_items
-        WHERE user_id IS NULL
-        ORDER BY created_at DESC
+        SELECT
+          f.*,
+          FALSE AS is_liked,
+          FALSE AS has_seen,
+          0 AS user_view_count
+        FROM feed_items f
+        WHERE f.user_id IS NULL
+        ORDER BY f.created_at DESC
       `;
     }
 
@@ -1992,8 +2577,8 @@ initDb()
   .then(seedFeedIfEmpty)
   .then(localizeRemoteFeedVideos)
   .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Feed server running on http://localhost:${PORT}`);
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Feed server running on port ${PORT}`);
     });
   })
   .catch((error) => {
