@@ -24,6 +24,41 @@ The project has:
    - AIVA generation + status (`/aiva/generate`, `/aiva/status`)
 4. Backend persists users, sessions, feed data, and generation jobs in Postgres.
 
+### AIVA recommendation system (feed ranking)
+
+The recommendation logic currently runs in the frontend (`Frontend/App.js`) and ranks the non-profile feed in two stages.
+
+1. Candidate set:
+   - Start from `candidateFeed` (all posts except your own when browsing the main feed).
+2. Stage 1 keyword + behavior score:
+   - Build token sets from each post's `username`, `caption`, `audio`, and comment text.
+   - Build a user-interest token profile from prior interactions:
+     - followed creator
+     - liked post
+     - comments you wrote
+     - view counts
+   - Score every post with weighted signals:
+     - unseen boost (largest weight)
+     - followed creator boost
+     - liked/commented/viewed boosts
+     - token similarity to your interest profile
+     - small recency bonus based on current ordering
+   - Sort by this score to get stage-1 ranking.
+3. Stage 2 learned reranker:
+   - Build training rows from items you have viewed or liked.
+   - Label = `1` for liked, `0` for viewed-but-not-liked.
+   - Train lightweight logistic-regression models on-device:
+     - learned model (behavior features)
+     - hybrid model (behavior + stage-1 keyword score feature)
+   - Predict probabilities for all stage-1 items and compute final score:
+     - `finalScore = hybridProbability * 0.85 + learnedProbability * 0.15`
+4. Final ordering rules:
+   - Unseen items are always placed before seen items.
+   - Within those groups, sort by `finalScore` (then stage-1 score for tie-breaks).
+   - While you are scrolling, already-viewed positions are partially frozen to avoid feed jumping.
+5. Built-in evaluation:
+   - The app logs `like@k` and `AUC` for keyword vs learned vs hybrid ranking in console (`[Recommender Eval]`), using a deterministic train/test split.
+
 ### AI video generation flow
 
 1. User selects/upload images in the app.
