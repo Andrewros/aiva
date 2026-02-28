@@ -13,20 +13,36 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.andrewrosenblum.aiva"
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "package": "com.anonymous.Frontend"
     },
     "web": {
       "favicon": "./assets/favicon.png"
     },
+    "extra": {
+      "admobAppId": "ca-app-pub-5075530037572927~7340043041",
+      "admobInterstitialUnitId": "ca-app-pub-5075530037572927/5145629126",
+      "eas": {
+        "projectId": "cebe74ed-6e44-4aa9-a975-75727420b885"
+      }
+    },
     "plugins": [
-      "expo-video"
+      "expo-video",
+      [
+        "react-native-google-mobile-ads",
+        {
+          "iosAppId": "ca-app-pub-5075530037572927~7340043041",
+          "androidAppId": "ca-app-pub-5075530037572927~9934416794"
+        }
+      ]
     ]
   }
 }

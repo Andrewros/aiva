@@ -16,9 +16,25 @@ app.use(cors());
 app.use(express.json());
 app.get("/health", (_req, res) => res.send("ok"));
 
+function readPositiveIntEnv(name, fallback) {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.PG_SSL === "true" ? { rejectUnauthorized: false } : false,
+  max: readPositiveIntEnv("PG_POOL_MAX", 10),
+  idleTimeoutMillis: readPositiveIntEnv("PG_IDLE_TIMEOUT_MS", 30000),
+  connectionTimeoutMillis: readPositiveIntEnv("PG_CONNECTION_TIMEOUT_MS", 15000),
+  keepAlive: true,
+  keepAliveInitialDelayMillis: readPositiveIntEnv(
+    "PG_KEEPALIVE_INITIAL_DELAY_MS",
+    10000
+  ),
+});
+pool.on("error", (error) => {
+  console.error("Postgres pool idle client error:", error);
 });
 
 const UPLOADS_DIR = path.join(__dirname, "uploads");

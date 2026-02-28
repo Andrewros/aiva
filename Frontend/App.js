@@ -14,8 +14,16 @@ import {
 	TextInput,
 	Image,
 	Modal,
+	Alert,
 } from "react-native";
 import { VideoView, useVideoPlayer } from "expo-video";
+// Ads temporarily disabled until AdMob app approval.
+// To re-enable, uncomment the import below and the "ADS (disabled)" blocks in this file.
+// import mobileAds, {
+// 	InterstitialAd as GoogleInterstitialAd,
+// 	AdEventType,
+// 	TestIds,
+// } from "react-native-google-mobile-ads";
 import * as ImagePicker from "expo-image-picker";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import CommentsSection from "./CommentsSection";
@@ -29,10 +37,35 @@ function resolveApiBaseUrl(rawValue) {
 	return `http://${value}`;
 }
 
+function resolveAssetUrl(rawValue, baseUrl = API_BASE_URL) {
+	const value = String(rawValue || "").trim();
+	if (!value) return "";
+	if (/^(https?:|file:|data:)/i.test(value)) return value;
+	if (value.startsWith("/")) return `${String(baseUrl || "").replace(/\/+$/, "")}${value}`;
+	return value;
+}
+
+function withCacheBust(rawValue, nonce) {
+	const value = String(rawValue || "").trim();
+	if (!value || !nonce) return value;
+	const sep = value.includes("?") ? "&" : "?";
+	return `${value}${sep}v=${encodeURIComponent(String(nonce))}`;
+}
+
 const API_BASE_URL = resolveApiBaseUrl(process.env.EXPO_PUBLIC_API_BASE_URL);
+const AIVA_VIDEO_LIMIT = 3;
 const AUTH_SESSION_STORAGE_KEY = "aiva_auth_session_v1";
 const MAX_AIVA_IMAGES = 12;
 const AIVA_SECONDS_PER_IMAGE = 5;
+// ADS (disabled):
+// const AIVA_ADS_PER_REWARDED_VIDEO = 10;
+// const AD_TRIGGER_SCORE = 10;
+// const ADMOB_APP_ID = "ca-app-pub-5075530037572927~7340043041";
+// const ADMOB_INTERSTITIAL_UNIT_ID = "ca-app-pub-5075530037572927/5145629126";
+// const USE_TEST_ADS =
+// 	String(process.env.EXPO_PUBLIC_USE_TEST_ADS || "")
+// 		.trim()
+// 		.toLowerCase() === "true";
 
 // 1534 -> "1.5k", supports up to trillions.
 function convertNumberToLetter(num) {
@@ -145,14 +178,35 @@ function normalizeFeedItems(items) {
 			caption: String(raw?.caption ?? ""),
 			audio: String(raw?.audio ?? ""),
 			uri,
+			createdAt: String(raw?.createdAt ?? raw?.created_at ?? "").trim(),
 			poster: String(raw?.poster ?? raw?.posterUrl ?? "").trim(),
 			likes: Number(raw?.likes) || 0,
+			isLiked: Boolean(raw?.isLiked),
+			hasSeen: Boolean(raw?.hasSeen),
+			userViewCount: Number(raw?.userViewCount ?? 0) || 0,
 			comments,
 			commentsCount,
 		});
 	}
 
 	return normalized;
+}
+
+function getCreatedAtTimestamp(value) {
+	const parsed = Date.parse(String(value || ""));
+	return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function sortByCreatedAtDesc(items) {
+	return [...items]
+		.map((post, index) => ({ post, index }))
+		.sort((a, b) => {
+			const at = getCreatedAtTimestamp(a.post?.createdAt);
+			const bt = getCreatedAtTimestamp(b.post?.createdAt);
+			if (bt !== at) return bt - at;
+			return a.index - b.index;
+		})
+		.map((row) => row.post);
 }
 
 function tokenizeText(value) {
@@ -175,25 +229,19 @@ function getPostTokenSet(post) {
 	);
 }
 
-function rankFeedItems({
+function buildProfileTokenWeights({
 	items,
 	followedUsers,
 	userCommentCountsById,
 	userViewCountsById,
 }) {
-	const W_SUBSCRIBED = 120;
-	const W_LIKED = 95;
-	const W_COMMENTED = 35;
-	const W_VIEWS = 22;
-	const W_SIMILARITY = 80;
-
 	const prepared = items.map((post, index) => ({
 		post,
 		index,
 		tokens: getPostTokenSet(post),
 	}));
+	const tokenWeights = {};
 
-	const profileTokenWeights = {};
 	for (const item of prepared) {
 		const { post, tokens } = item;
 		const liked = !!post.isLiked;
@@ -207,42 +255,259 @@ function rankFeedItems({
 		if (viewsByUser > 0) interactionWeight += Math.min(2.2, Math.log1p(viewsByUser));
 		if (interactionWeight <= 0) continue;
 		for (const token of tokens) {
-			profileTokenWeights[token] =
-				(profileTokenWeights[token] || 0) + interactionWeight;
+			tokenWeights[token] = (tokenWeights[token] || 0) + interactionWeight;
 		}
 	}
 
-	const profileMass = Object.values(profileTokenWeights).reduce(
-		(sum, value) => sum + value,
-		0
-	);
+	const tokenMass = Object.values(tokenWeights).reduce((sum, value) => sum + value, 0);
+	return { prepared, tokenWeights, tokenMass };
+}
+
+function computeKeywordScore({
+	post,
+	index,
+	postTokens,
+	followedUsers,
+	userCommentCountsById,
+	userViewCountsById,
+	tokenWeights,
+	tokenMass,
+}) {
+	const W_SUBSCRIBED = 120;
+	const W_LIKED = 95;
+	const W_COMMENTED = 35;
+	const W_VIEWS = 22;
+	const W_SIMILARITY = 80;
+	const W_RECENCY = 8;
+	const W_UNSEEN = 220;
+	const commentsByUser = Number(userCommentCountsById[post.id] || 0);
+	const viewsByUser = Number(userViewCountsById[post.id] || 0);
+	let similarity = 0;
+
+	if (tokenMass > 0 && postTokens.size > 0) {
+		let overlap = 0;
+		for (const token of postTokens) overlap += tokenWeights[token] || 0;
+		similarity = overlap / tokenMass;
+	}
+
+	let score = 0;
+	if (followedUsers.has(post.username)) score += W_SUBSCRIBED;
+	if (post.isLiked) score += W_LIKED;
+	if (!post.hasSeen) score += W_UNSEEN;
+	score += Math.min(3, commentsByUser) * W_COMMENTED;
+	score += Math.min(2.5, Math.log1p(viewsByUser)) * W_VIEWS;
+	score += similarity * W_SIMILARITY;
+	score += Math.max(0, 1 - index / 20) * W_RECENCY;
+
+	return { score, similarity };
+}
+
+function generateStage1Candidates({
+	items,
+	followedUsers,
+	userCommentCountsById,
+	userViewCountsById,
+	maxCandidates = 120,
+}) {
+	const { prepared, tokenWeights, tokenMass } = buildProfileTokenWeights({
+		items,
+		followedUsers,
+		userCommentCountsById,
+		userViewCountsById,
+	});
 
 	const scored = prepared.map(({ post, index, tokens }) => {
-		const commentsByUser = Number(userCommentCountsById[post.id] || 0);
-		const viewsByUser = Number(userViewCountsById[post.id] || 0);
+		const { score, similarity } = computeKeywordScore({
+			post,
+			index,
+			postTokens: tokens,
+			followedUsers,
+			userCommentCountsById,
+			userViewCountsById,
+			tokenWeights,
+			tokenMass,
+		});
 
-		let similarity = 0;
-		if (profileMass > 0 && tokens.size > 0) {
-			let overlap = 0;
-			for (const token of tokens) overlap += profileTokenWeights[token] || 0;
-			similarity = overlap / profileMass;
-		}
-
-		let score = 0;
-		if (followedUsers.has(post.username)) score += W_SUBSCRIBED;
-		if (post.isLiked) score += W_LIKED;
-		score += Math.min(3, commentsByUser) * W_COMMENTED;
-		score += Math.min(2.5, Math.log1p(viewsByUser)) * W_VIEWS;
-		score += similarity * W_SIMILARITY;
-
-		return { post, score, index };
+		return {
+			post,
+			index,
+			tokens,
+			keywordScore: score,
+			similarity,
+		};
 	});
 
 	scored.sort((a, b) => {
-		if (b.score !== a.score) return b.score - a.score;
+		if (b.keywordScore !== a.keywordScore) return b.keywordScore - a.keywordScore;
 		return a.index - b.index;
 	});
-	return scored.map((entry) => entry.post);
+
+	return scored.slice(0, Math.min(maxCandidates, scored.length));
+}
+
+function sigmoid(x) {
+	return 1 / (1 + Math.exp(-x));
+}
+
+function logisticPredict(weights, features) {
+	let z = 0;
+	for (let i = 0; i < weights.length; i += 1) {
+		z += weights[i] * features[i];
+	}
+	return sigmoid(Math.max(-20, Math.min(20, z)));
+}
+
+function trainLogisticRegression(samples, featureLength, opts = {}) {
+	if (!samples.length || !featureLength) {
+		return { weights: new Array(featureLength).fill(0) };
+	}
+	const learningRate = opts.learningRate ?? 0.1;
+	const epochs = opts.epochs ?? 160;
+	const l2 = opts.l2 ?? 0.002;
+	const weights = new Array(featureLength).fill(0);
+
+	for (let epoch = 0; epoch < epochs; epoch += 1) {
+		const gradient = new Array(featureLength).fill(0);
+		for (const sample of samples) {
+			const p = logisticPredict(weights, sample.features);
+			const error = p - sample.label;
+			for (let i = 0; i < featureLength; i += 1) {
+				gradient[i] += error * sample.features[i];
+			}
+		}
+		for (let i = 0; i < featureLength; i += 1) {
+			const reg = i === 0 ? 0 : l2 * weights[i];
+			weights[i] -= learningRate * (gradient[i] / samples.length + reg);
+		}
+	}
+
+	return { weights };
+}
+
+function buildModelFeatures({
+	keywordScore,
+	similarity,
+	post,
+	stage1RankIndex,
+	followedUsers,
+	userCommentCountsById,
+	userViewCountsById,
+	includeKeywordFeature,
+}) {
+	const viewsByUser = Number(userViewCountsById[post.id] || 0);
+	const commentsByUser = Number(userCommentCountsById[post.id] || 0);
+	const followed = followedUsers.has(post.username) ? 1 : 0;
+	const liked = post.isLiked ? 1 : 0;
+	const unseen = post.hasSeen ? 0 : 1;
+	const rankNorm = 1 - Math.min(1, stage1RankIndex / 40);
+	const logKeyword = Math.log1p(Math.max(0, keywordScore)) / 8;
+
+	const features = [
+		1,
+		unseen,
+		followed,
+		liked,
+		Math.min(1, Math.log1p(viewsByUser) / 3),
+		Math.min(1, Math.log1p(commentsByUser) / 3),
+		Math.min(1, Math.max(0, similarity)),
+		rankNorm,
+	];
+
+	if (includeKeywordFeature) {
+		features.push(Math.min(1.5, logKeyword));
+	}
+	return features;
+}
+
+function splitTrainTestRows(rows) {
+	const train = [];
+	const test = [];
+	for (const row of rows) {
+		const bucket =
+			String(row.postId || "")
+				.split("")
+				.reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % 10;
+		if (bucket <= 7) train.push(row);
+		else test.push(row);
+	}
+	return { train, test };
+}
+
+function computeAuc(rows, scoreById) {
+	const positives = rows.filter((r) => r.label === 1);
+	const negatives = rows.filter((r) => r.label === 0);
+	if (!positives.length || !negatives.length) return null;
+	let wins = 0;
+	let pairs = 0;
+	for (const pos of positives) {
+		for (const neg of negatives) {
+			const ps = scoreById[pos.postId] ?? 0;
+			const ns = scoreById[neg.postId] ?? 0;
+			if (ps > ns) wins += 1;
+			else if (ps === ns) wins += 0.5;
+			pairs += 1;
+		}
+	}
+	return pairs > 0 ? wins / pairs : null;
+}
+
+function likeRateAtK(rows, orderedIds, k = 5) {
+	if (!rows.length || !orderedIds.length) return null;
+	const byId = new Map(rows.map((r) => [r.postId, r.label]));
+	const top = orderedIds.slice(0, Math.max(1, k)).filter((id) => byId.has(id));
+	if (!top.length) return null;
+	const likes = top.reduce((sum, id) => sum + (byId.get(id) ? 1 : 0), 0);
+	return likes / top.length;
+}
+
+function evaluateRecommendationModels({ rows, stage1ById, learnedScoresById, hybridScoresById }) {
+	if (rows.length < 4) return null;
+	const keywordScoresById = {};
+	for (const row of rows) {
+		keywordScoresById[row.postId] = stage1ById[row.postId]?.keywordScore ?? 0;
+	}
+	const orderedBy = (scores) =>
+		Object.keys(scores).sort((a, b) => (scores[b] ?? 0) - (scores[a] ?? 0));
+	const keywordOrder = orderedBy(keywordScoresById);
+	const learnedOrder = orderedBy(learnedScoresById);
+	const hybridOrder = orderedBy(hybridScoresById);
+	const k = Math.min(5, rows.length);
+	const keywordLikeRate = likeRateAtK(rows, keywordOrder, k);
+	const learnedLikeRate = likeRateAtK(rows, learnedOrder, k);
+	const hybridLikeRate = likeRateAtK(rows, hybridOrder, k);
+	const keywordAuc = computeAuc(rows, keywordScoresById);
+	const learnedAuc = computeAuc(rows, learnedScoresById);
+	const hybridAuc = computeAuc(rows, hybridScoresById);
+
+	const improvementPct =
+		keywordLikeRate != null && hybridLikeRate != null && keywordLikeRate > 0
+			? ((hybridLikeRate - keywordLikeRate) / keywordLikeRate) * 100
+			: null;
+
+	return {
+		k,
+		keywordLikeRate,
+		learnedLikeRate,
+		hybridLikeRate,
+		keywordAuc,
+		learnedAuc,
+		hybridAuc,
+		improvementPct,
+	};
+}
+
+function buildTrainingRows(stage1Candidates, userViewCountsById) {
+	return stage1Candidates
+		.filter((entry) => {
+			const viewed = Number(userViewCountsById[entry.post.id] || 0) > 0;
+			return viewed || entry.post.isLiked;
+		})
+		.map((entry, stage1RankIndex) => ({
+			postId: entry.post.id,
+			label: entry.post.isLiked ? 1 : 0,
+			stage1RankIndex,
+			entry,
+		}));
 }
 
 function FollowButton({
@@ -251,18 +516,11 @@ function FollowButton({
 	followedUsersRef,
 	onToggleFollow,
 }) {
-	const [isFollowed, setIsFollowed] = useState(() =>
-		followedUsersRef.current.has(username)
-	);
 	const isSelf = username === currentUser;
-
-	useEffect(() => {
-		setIsFollowed(followedUsersRef.current.has(username));
-	}, [username, followedUsersRef]);
+	const isFollowed = followedUsersRef.current.has(username);
 
 	const onPress = useCallback(() => {
 		if (isSelf) return;
-		setIsFollowed((prev) => !prev);
 		onToggleFollow(username);
 	}, [isSelf, onToggleFollow, username]);
 
@@ -298,6 +556,9 @@ function NativeVideoPost({
 	onToggleLike,
 	onOpenComments,
 	onToggleFollow,
+	onOpenUserProfile,
+	onDeleteVideo,
+	onDeleteChannel,
 	followedUsersRef,
 	currentUser,
 }) {
@@ -418,6 +679,24 @@ function NativeVideoPost({
 		onToggleLike(item.id);
 		runLikePop();
 	}, [item.id, onToggleLike, runLikePop]);
+	const onPressDeleteVideo = useCallback(() => {
+		Alert.alert(
+			"Delete video?",
+			"This action cannot be undone.",
+			[
+				{ text: "Cancel", style: "cancel" },
+				{
+					text: "Delete",
+					style: "destructive",
+					onPress: () => onDeleteVideo?.(item.id),
+				},
+			]
+		);
+	}, [item.id, onDeleteVideo]);
+	const isAdmin = currentUser === "andrewr";
+	const isOwner = currentUser === item.username;
+	const canDeleteVideo = isOwner || isAdmin;
+	const canDeleteChannel = isAdmin && item.username !== "andrewr";
 
 	return (
 		<View style={styles.page}>
@@ -478,7 +757,7 @@ function NativeVideoPost({
 				</TouchableOpacity>
 
 				{/* Share button placeholder */}
-				<TouchableOpacity
+				{/* <TouchableOpacity
 					activeOpacity={0.85}
 					onPress={() => console.log("share")}
 					hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}
@@ -486,7 +765,7 @@ function NativeVideoPost({
 				>
 					<Text style={styles.icon}>↗</Text>
 					<Text style={styles.count}>Share</Text>
-				</TouchableOpacity>
+				</TouchableOpacity> */}
 			</View>
 
 			{/* Like pop animation overlay */}
@@ -513,7 +792,13 @@ function NativeVideoPost({
 			{/* Post metadata */}
 			<View style={styles.bottomMeta} pointerEvents="box-none">
 				<View style={styles.usernameRow}>
-					<Text style={styles.username}>@{item.username}</Text>
+					<TouchableOpacity
+						onPress={() => onOpenUserProfile?.(item.username)}
+						activeOpacity={0.85}
+						style={styles.usernameButton}
+					>
+						<Text style={styles.username}>@{item.username}</Text>
+					</TouchableOpacity>
 					<FollowButton
 						username={item.username}
 						currentUser={currentUser}
@@ -523,6 +808,24 @@ function NativeVideoPost({
 				</View>
 				<Text style={styles.caption}>{item.caption}</Text>
 				<Text style={styles.audio}>♫ {item.audio}</Text>
+				{canDeleteVideo ? (
+					<TouchableOpacity
+						onPress={onPressDeleteVideo}
+						activeOpacity={0.9}
+						style={styles.deleteVideoButton}
+					>
+						<Text style={styles.deleteVideoButtonText}>Delete Video</Text>
+					</TouchableOpacity>
+				) : null}
+				{canDeleteChannel ? (
+					<TouchableOpacity
+						onPress={() => onDeleteChannel?.(item.username)}
+						activeOpacity={0.9}
+						style={styles.deleteChannelButton}
+					>
+						<Text style={styles.deleteChannelButtonText}>Delete Channel</Text>
+					</TouchableOpacity>
+				) : null}
 			</View>
 		</View>
 	);
@@ -531,6 +834,35 @@ function NativeVideoPost({
 function VideoPost(props) {
 	return <NativeVideoPost {...props} />;
 }
+
+// ADS (disabled):
+// function AdFallbackModal({ visible, onClose, score }) {
+// 	return (
+// 		<Modal transparent visible={visible} animationType="fade" onRequestClose={onClose}>
+// 			<View style={styles.adBackdrop}>
+// 				<View style={styles.adCard}>
+// 					<Text style={styles.adBadge}>Sponsored</Text>
+// 					<Text style={styles.adTitle}>Ad Break</Text>
+// 					<Text style={styles.adText}>
+// 						Ad fallback shown because a real interstitial was not loaded yet.
+// 					</Text>
+// 					<Text style={styles.adMeta}>App ID: {ADMOB_APP_ID}</Text>
+// 					<Text style={styles.adMeta}>Unit ID: {ADMOB_INTERSTITIAL_UNIT_ID}</Text>
+// 					<Text style={styles.adMeta}>
+// 						Trigger score reset. Current score: {score}/{AD_TRIGGER_SCORE}
+// 					</Text>
+// 					<TouchableOpacity
+// 						onPress={onClose}
+// 						activeOpacity={0.9}
+// 						style={styles.adCloseButton}
+// 					>
+// 						<Text style={styles.adCloseButtonText}>Continue</Text>
+// 					</TouchableOpacity>
+// 				</View>
+// 			</View>
+// 		</Modal>
+// 	);
+// }
 
 export default function App() {
 	const [authBooting, setAuthBooting] = useState(true);
@@ -547,19 +879,27 @@ export default function App() {
 	const [authDebugCode, setAuthDebugCode] = useState("");
 	const currentUser = authUser?.username ?? "";
 	const currentUserId = authUser?.id ?? "";
-	const currentUserProfilePicture = String(authUser?.profilePicture || "").trim();
+	const [profilePictureRefreshNonce, setProfilePictureRefreshNonce] = useState(0);
+	const [profilePictureLocalPreview, setProfilePictureLocalPreview] = useState("");
+	const currentUserProfilePicture = resolveAssetUrl(authUser?.profilePicture || "");
+	const displayedProfilePicture = profilePictureLocalPreview
+		? profilePictureLocalPreview
+		: withCacheBust(currentUserProfilePicture, profilePictureRefreshNonce);
 	// Active index controls which item should auto-play.
 	const [activeIndex, setActiveIndex] = useState(0);
 	const [searchQuery, setSearchQuery] = useState("");
 	const [isSearchOpen, setIsSearchOpen] = useState(false);
 	const [feedFilter, setFeedFilter] = useState("all");
+	const [selectedProfileUsername, setSelectedProfileUsername] = useState("");
 	const [isFeedVisible, setIsFeedVisible] = useState(true);
 	const [isLoadingFeed, setIsLoadingFeed] = useState(true);
 	const [feedError, setFeedError] = useState(null);
+	const [maxIndex, setMaxIndex] = useState(0);
 	const pagerRef = useRef(null);
 	const feedListRef = useRef(null);
 	const lastFeedEntryRef = useRef("manual");
 	const [pendingFeedIndex, setPendingFeedIndex] = useState(null);
+	const [pendingFeedPostId, setPendingFeedPostId] = useState(null);
 	const [isGeneratingAiva, setIsGeneratingAiva] = useState(false);
 	const [isAivaPromptOpen, setIsAivaPromptOpen] = useState(false);
 	const [aivaTitle, setAivaTitle] = useState("");
@@ -569,6 +909,8 @@ export default function App() {
 	const [aivaError, setAivaError] = useState(null);
 	const [isAivaWaiting, setIsAivaWaiting] = useState(false);
 	const [aivaProgress, setAivaProgress] = useState(0);
+	const [aivaVideoCount, setAivaVideoCount] = useState(0);
+	const [aivaVideoLimit, setAivaVideoLimit] = useState(AIVA_VIDEO_LIMIT);
 	const [isResettingUploads, setIsResettingUploads] = useState(false);
 	const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 	const [settingsBusy, setSettingsBusy] = useState(false);
@@ -578,18 +920,41 @@ export default function App() {
 	const [settingsPhoneCode, setSettingsPhoneCode] = useState("");
 	const [settingsNewPassword, setSettingsNewPassword] = useState("");
 	const [settingsPasswordCode, setSettingsPasswordCode] = useState("");
+	const [isFollowingListOpen, setIsFollowingListOpen] = useState(false);
+	const [isDeletingVideo, setIsDeletingVideo] = useState(false);
+	const [isDeletingChannel, setIsDeletingChannel] = useState(false);
 	const [followVersion, setFollowVersion] = useState(0);
 	const [userCommentCountsById, setUserCommentCountsById] = useState({});
 	const [userViewCountsById, setUserViewCountsById] = useState({});
+	// ADS (disabled):
+	// const [adScoreCount, setAdScoreCount] = useState(0);
+	// const [isAdOpen, setIsAdOpen] = useState(false);
+	// const adSeenIdsRef = useRef(new Set());
+	// const interstitialRef = useRef(null);
+	// const interstitialSubscriptionsRef = useRef([]);
+	// const isInterstitialLoadedRef = useRef(false);
+	// const isInterstitialRetryingRef = useRef(false);
+	const currentVisiblePostIdRef = useRef(null);
+	const pendingViewPostIdsRef = useRef(new Set());
 	const lastViewedPostIdRef = useRef(null);
-	const queueInitializedRef = useRef(false);
-	const lastQueueSearchRef = useRef("");
 	const shouldScrollToTopRef = useRef(false);
+	const lastRecommendationSignatureRef = useRef("");
 	const aivaPollRef = useRef(null);
 	const aivaProgressTimerRef = useRef(null);
+	// ADS (disabled):
+	// const rewardAdPendingRef = useRef(false);
+	// const rewardAdCompletionHandlerRef = useRef(null);
+	const aivaVideosLeft = Math.max(
+		0,
+		Math.max(0, Number(aivaVideoLimit) || 0) - Math.max(0, Number(aivaVideoCount) || 0)
+	);
 
 	// Local feed state to store per-item likes and comments.
 	const [feed, setFeed] = useState([]);
+
+	useEffect(() => {
+		setSelectedProfileUsername(currentUser);
+	}, [currentUser]);
 
 	const apiFetch = useCallback(async (path, options = {}) => {
 		const headers = { ...(options.headers || {}) };
@@ -610,6 +975,15 @@ export default function App() {
 		}
 	}, [authToken]);
 
+	// ADS (disabled):
+	// const completeRewardAdView = useCallback(async () => { ... }, []);
+	// useEffect(() => {
+	// 	rewardAdCompletionHandlerRef.current = completeRewardAdView;
+	// }, [completeRewardAdView]);
+	// const prepareInterstitial = useCallback(() => { ... }, []);
+	// const showInterstitialAd = useCallback(() => { ... }, [prepareInterstitial]);
+	// const handleWatchRewardAd = useCallback(() => { ... }, [prepareInterstitial]);
+
 	const persistAuthSession = useCallback(async (token, user) => {
 		const payload = { token, user };
 		await AsyncStorage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify(payload));
@@ -620,6 +994,10 @@ export default function App() {
 	const clearAuthSession = useCallback(async () => {
 		setAuthToken(null);
 		setAuthUser(null);
+		setAivaVideoCount(0);
+		setAivaVideoLimit(AIVA_VIDEO_LIMIT);
+		followedUsersRef.current = new Set();
+		setFollowVersion((v) => v + 1);
 		setAuthStep("credentials");
 		setAuthError(null);
 		setAuthDebugCode("");
@@ -677,8 +1055,9 @@ export default function App() {
 	const hydrateFeed = useCallback((items) => {
 		return items.map((p) => ({
 			...p,
-			isLiked: false,
-			likesCount: p.likes,
+			isLiked: !!p.isLiked,
+			likesCount: Number(p.likesCount ?? p.likes ?? 0),
+			hasSeen: !!p.hasSeen,
 		}));
 	}, []);
 
@@ -696,6 +1075,12 @@ export default function App() {
 			const data = await response.json();
 			const normalized = normalizeFeedItems(data);
 			setFeed(hydrateFeed(normalized));
+			const nextViewCounts = {};
+			for (const item of normalized) {
+				const count = Number(item.userViewCount || 0);
+				if (count > 0) nextViewCounts[item.id] = count;
+			}
+			setUserViewCountsById(nextViewCounts);
 		} catch (error) {
 			setFeed([]);
 			setFeedError(error?.message ?? "Failed to load feed.");
@@ -704,13 +1089,64 @@ export default function App() {
 		}
 	}, [apiFetch, currentUserId, hydrateFeed]);
 
+	const loadFollowing = useCallback(async () => {
+		try {
+			const response = await apiFetch("/following");
+			const body = await response.json().catch(() => ({}));
+			if (!response.ok) {
+				throw new Error(body?.error || `Following request failed (${response.status})`);
+			}
+			const usernames = Array.isArray(body?.usernames)
+				? body.usernames
+						.map((name) => String(name || "").trim())
+						.filter(Boolean)
+				: [];
+			followedUsersRef.current = new Set(usernames);
+			setFollowVersion((v) => v + 1);
+		} catch (error) {
+			console.warn("Failed to load following:", error);
+			followedUsersRef.current = new Set();
+			setFollowVersion((v) => v + 1);
+		}
+	}, [apiFetch]);
+
+	const loadAivaStatus = useCallback(async () => {
+		if (!currentUserId) return;
+		try {
+			const response = await apiFetch(
+				`/aiva/status?userId=${encodeURIComponent(currentUserId)}`
+			);
+			const body = await response.json().catch(() => ({}));
+			if (!response.ok) {
+				throw new Error(body?.error || `AIVA status failed (${response.status})`);
+			}
+			const nextCount = Number(body?.count ?? 0);
+			const nextLimit = Number(body?.limit ?? AIVA_VIDEO_LIMIT);
+			setAivaVideoCount(Number.isFinite(nextCount) ? nextCount : 0);
+			setAivaVideoLimit(Number.isFinite(nextLimit) ? nextLimit : AIVA_VIDEO_LIMIT);
+		} catch (error) {
+			console.warn("Failed to load AIVA status:", error);
+		}
+	}, [apiFetch, currentUserId]);
+
 	useEffect(() => {
 		if (!authUser || !authToken) return;
 		loadFeed();
-	}, [authToken, authUser, loadFeed]);
+		loadFollowing();
+		loadAivaStatus();
+	}, [authToken, authUser, loadFeed, loadFollowing, loadAivaStatus]);
 
 	useEffect(() => {
 		return () => {
+			// ADS (disabled):
+			// for (const unsubscribe of interstitialSubscriptionsRef.current) {
+			// 	try {
+			// 		unsubscribe?.();
+			// 	} catch {
+			// 		// ignore listener cleanup issues
+			// 	}
+			// }
+			// interstitialSubscriptionsRef.current = [];
 			if (aivaPollRef.current) {
 				clearInterval(aivaPollRef.current);
 				aivaPollRef.current = null;
@@ -721,6 +1157,16 @@ export default function App() {
 			}
 		};
 	}, []);
+
+	// ADS (disabled):
+	// useEffect(() => {
+	// 	mobileAds()
+	// 		.initialize()
+	// 		.then(() => prepareInterstitial())
+	// 		.catch((error) => {
+	// 			console.warn("AdMob initialization failed:", error);
+	// 		});
+	// }, [prepareInterstitial]);
 
 	const addAivaImageUrl = useCallback(() => {
 		const trimmed = aivaImageUrlInput.trim();
@@ -764,6 +1210,14 @@ export default function App() {
 				);
 				if (!response.ok) return;
 				const data = await response.json();
+				const nextCount = Number(data?.count ?? 0);
+				const nextLimit = Number(data?.limit ?? AIVA_VIDEO_LIMIT);
+				if (Number.isFinite(nextCount)) {
+					setAivaVideoCount(nextCount);
+				}
+				if (Number.isFinite(nextLimit)) {
+					setAivaVideoLimit(nextLimit);
+				}
 				const status = data?.job?.status;
 				if (status === "succeeded") {
 					clearInterval(aivaPollRef.current);
@@ -803,13 +1257,19 @@ export default function App() {
 			return;
 		}
 
-		const result = await ImagePicker.launchImageLibraryAsync({
-			mediaTypes: ImagePicker.MediaTypeOptions.Images,
-			allowsEditing: false,
-			allowsMultipleSelection: true,
-			selectionLimit: MAX_AIVA_IMAGES,
-			quality: 0.9,
-		});
+		let result;
+		try {
+			result = await ImagePicker.launchImageLibraryAsync({
+				mediaTypes: ["images"],
+				allowsEditing: false,
+				allowsMultipleSelection: true,
+				selectionLimit: MAX_AIVA_IMAGES,
+				quality: 0.9,
+			});
+		} catch (error) {
+			setAivaError(error?.message || "Failed to open photo library.");
+			return;
+		}
 
 		if (result.canceled) return;
 		const pickedAssets = Array.isArray(result.assets)
@@ -937,7 +1397,7 @@ export default function App() {
 	]);
 
 	const handleResetUploadCount = useCallback(async () => {
-		if (isResettingUploads || currentUserId !== "andrew") return;
+		if (isResettingUploads || currentUser.toLowerCase() !== "andrewr") return;
 		setIsResettingUploads(true);
 		setAivaError(null);
 		try {
@@ -950,13 +1410,14 @@ export default function App() {
 				const body = await response.json().catch(() => ({}));
 				throw new Error(body?.error || `Reset failed (${response.status})`);
 			}
+			setAivaVideoCount(0);
 			await loadFeed();
 		} catch (error) {
 			setAivaError(error?.message ?? "Failed to reset upload count.");
 		} finally {
 			setIsResettingUploads(false);
 		}
-	}, [apiFetch, currentUserId, isResettingUploads, loadFeed]);
+	}, [apiFetch, currentUser, currentUserId, isResettingUploads, loadFeed]);
 
 	const handleStartRegister = useCallback(async () => {
 		setAuthBusy(true);
@@ -1075,19 +1536,29 @@ export default function App() {
 	}, [apiFetch, clearAuthSession]);
 
 	const handlePickProfilePhoto = useCallback(async () => {
+		if (settingsBusy) return;
 		const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
 		if (permission.status !== "granted") {
 			setSettingsError("Photo access is required to pick a profile photo.");
 			return;
 		}
-		const result = await ImagePicker.launchImageLibraryAsync({
-			mediaTypes: ImagePicker.MediaTypeOptions.Images,
-			allowsEditing: true,
-			quality: 0.9,
-		});
+
+		let result;
+		try {
+			result = await ImagePicker.launchImageLibraryAsync({
+				mediaTypes: ["images"],
+				allowsEditing: false,
+				quality: 0.9,
+			});
+		} catch (error) {
+			setSettingsError(error?.message || "Failed to open photo library.");
+			return;
+		}
+
 		if (result.canceled) return;
 		const asset = result.assets?.[0];
 		if (!asset?.uri) return;
+		setProfilePictureLocalPreview(String(asset.uri));
 
 		const formData = new FormData();
 		formData.append("image", {
@@ -1097,7 +1568,9 @@ export default function App() {
 		});
 
 		try {
+			setSettingsBusy(true);
 			setSettingsError(null);
+			setSettingsInfo("");
 			const response = await apiFetch("/auth/profile-photo", {
 				method: "POST",
 				body: formData,
@@ -1106,11 +1579,44 @@ export default function App() {
 			if (!response.ok) {
 				throw new Error(body?.error || `Upload failed (${response.status})`);
 			}
-			await updateAuthUser(body?.user || null);
+			let responseOrigin = API_BASE_URL;
+			try {
+				responseOrigin = new URL(String(response?.url || API_BASE_URL)).origin;
+			} catch {
+				// Keep API_BASE_URL fallback when parsing fails.
+			}
+			const nextUser = body?.user
+				? {
+						...body.user,
+						profilePicture: resolveAssetUrl(
+							body.user.profilePicture,
+							responseOrigin
+						),
+				  }
+				: null;
+			await updateAuthUser(nextUser);
+			setProfilePictureLocalPreview(String(asset.uri));
+			const refreshNonce = Date.now();
+			setProfilePictureRefreshNonce(refreshNonce);
+			const remoteProfileUri = withCacheBust(
+				resolveAssetUrl(nextUser?.profilePicture || "", responseOrigin),
+				refreshNonce
+			);
+			if (remoteProfileUri) {
+				Image.prefetch(remoteProfileUri)
+					.then(() => setProfilePictureLocalPreview(""))
+					.catch(() => {
+						// Keep local preview if remote fetch is not ready yet.
+					});
+			}
+			setSettingsInfo("Profile photo updated.");
 		} catch (error) {
+			setProfilePictureLocalPreview("");
 			setSettingsError(error?.message ?? "Failed to upload profile photo.");
+		} finally {
+			setSettingsBusy(false);
 		}
-	}, [apiFetch, updateAuthUser]);
+	}, [apiFetch, settingsBusy, updateAuthUser]);
 
 	const handleStartPhoneChange = useCallback(async () => {
 		if (settingsBusy) return;
@@ -1212,37 +1718,157 @@ export default function App() {
 		}
 	}, [apiFetch, clearAuthSession, settingsBusy, settingsPasswordCode]);
 
-	// Toggle like: increment if not liked, decrement if liked.
-	const toggleLikeById = useCallback((postId) => {
-		setFeed((prev) =>
-			prev.map((p) => {
-				if (p.id !== postId) return p;
+	// Toggle like in UI optimistically, then persist to backend.
+	const toggleLikeById = useCallback(
+		async (postId) => {
+			let nextLikedValue = null;
+			setFeed((prev) =>
+				prev.map((p) => {
+					if (p.id !== postId) return p;
+					const nextLiked = !p.isLiked;
+					nextLikedValue = nextLiked;
+					const base = p.likesCount ?? p.likes ?? 0;
+					const nextCount = Math.max(0, base + (nextLiked ? 1 : -1));
+					return {
+						...p,
+						isLiked: nextLiked,
+						likes: nextCount,
+						likesCount: nextCount,
+					};
+				})
+			);
 
-				const nextLiked = !p.isLiked;
-				const base = p.likesCount ?? p.likes ?? 0;
+			if (nextLikedValue == null) return;
 
-				return {
-					...p,
-					isLiked: nextLiked,
-					likesCount: Math.max(0, base + (nextLiked ? 1 : -1)),
-				};
-			})
-		);
-	}, []);
+			try {
+				const response = await apiFetch(`/feed/${encodeURIComponent(postId)}/like`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ liked: nextLikedValue }),
+				});
+				const body = await response.json().catch(() => ({}));
+				if (!response.ok) {
+					throw new Error(body?.error || `Like failed (${response.status})`);
+				}
+				setFeed((prev) =>
+					prev.map((p) => {
+						if (p.id !== postId) return p;
+						const persistedLikes = Number(body?.likes ?? p.likesCount ?? p.likes ?? 0);
+						return {
+							...p,
+							isLiked: Boolean(body?.isLiked),
+							likes: persistedLikes,
+							likesCount: persistedLikes,
+						};
+					})
+				);
+			} catch (error) {
+				// Roll back optimistic update on failure.
+				setFeed((prev) =>
+					prev.map((p) => {
+						if (p.id !== postId) return p;
+						const rolledLiked = !nextLikedValue;
+						const base = p.likesCount ?? p.likes ?? 0;
+						const rolledCount = Math.max(0, base + (rolledLiked ? 1 : -1));
+						return {
+							...p,
+							isLiked: rolledLiked,
+							likes: rolledCount,
+							likesCount: rolledCount,
+						};
+					})
+				);
+				console.warn("Failed to persist like:", error);
+			}
+		},
+		[apiFetch]
+	);
 
 	// Follow state is kept in a ref to avoid forcing immediate re-renders.
 	const followedUsersRef = useRef(new Set());
 
-	const toggleFollowByUsername = useCallback((username) => {
-		const next = new Set(followedUsersRef.current);
-		if (next.has(username)) {
-			next.delete(username);
-		} else {
-			next.add(username);
-		}
-		followedUsersRef.current = next;
-		setFollowVersion((v) => v + 1);
-	}, []);
+	const toggleFollowByUsername = useCallback(
+		async (username) => {
+			const targetUsername = String(username || "").trim();
+			if (!targetUsername) return;
+
+			const previous = new Set(followedUsersRef.current);
+			const next = new Set(previous);
+			const nextFollowing = !next.has(targetUsername);
+			if (nextFollowing) {
+				next.add(targetUsername);
+			} else {
+				next.delete(targetUsername);
+			}
+			followedUsersRef.current = next;
+			setFollowVersion((v) => v + 1);
+
+			try {
+				const response = await apiFetch(
+					`/following/${encodeURIComponent(targetUsername)}`,
+					{
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ following: nextFollowing }),
+					}
+				);
+				const body = await response.json().catch(() => ({}));
+				if (!response.ok) {
+					throw new Error(body?.error || `Follow update failed (${response.status})`);
+				}
+				const persistedUsernames = Array.isArray(body?.usernames)
+					? body.usernames
+							.map((name) => String(name || "").trim())
+							.filter(Boolean)
+					: Array.from(next);
+				followedUsersRef.current = new Set(persistedUsernames);
+				setFollowVersion((v) => v + 1);
+			} catch (error) {
+				// Roll back optimistic follow toggle on API failure.
+				followedUsersRef.current = previous;
+				setFollowVersion((v) => v + 1);
+				console.warn("Failed to persist follow:", error);
+			}
+		},
+		[apiFetch]
+	);
+	const followedUsernames = useMemo(
+		() => Array.from(followedUsersRef.current).sort((a, b) => a.localeCompare(b)),
+		[followVersion]
+	);
+
+	const persistViewById = useCallback(
+		async (postId) => {
+			if (!postId || pendingViewPostIdsRef.current.has(postId)) return;
+			pendingViewPostIdsRef.current.add(postId);
+			try {
+				const response = await apiFetch(`/feed/${encodeURIComponent(postId)}/view`, {
+					method: "POST",
+				});
+				const body = await response.json().catch(() => ({}));
+				if (!response.ok) {
+					throw new Error(body?.error || `View tracking failed (${response.status})`);
+				}
+				const persistedCount = Number(body?.userViewCount || 0);
+				setUserViewCountsById((prev) => ({
+					...prev,
+					[postId]: Math.max(prev[postId] || 0, persistedCount),
+				}));
+				setFeed((prev) =>
+					prev.map((p) =>
+						p.id === postId
+							? { ...p, hasSeen: true, userViewCount: Math.max(p.userViewCount || 0, persistedCount) }
+							: p
+					)
+				);
+			} catch (error) {
+				console.warn("Failed to persist view:", error);
+			} finally {
+				pendingViewPostIdsRef.current.delete(postId);
+			}
+		},
+		[apiFetch]
+	);
 
 	// Consider an item active once most of it is visible.
 	const viewabilityConfig = useMemo(
@@ -1253,18 +1879,36 @@ export default function App() {
 	);
 
 	// Track the topmost visible item index.
-	const onViewableItemsChanged = useRef(({ viewableItems }) => {
+	const onViewableItemsChanged = useCallback(({ viewableItems }) => {
 		if (!viewableItems.length) return;
 		const top = viewableItems[0];
-		setActiveIndex(top.index);
+		const topIndex = Number.isInteger(top?.index) ? top.index : 0;
+		setActiveIndex(topIndex);
+		setMaxIndex((prev) => Math.max(prev, topIndex));
 		const postId = top?.item?.id;
+		currentVisiblePostIdRef.current = postId || null;
 		if (!postId || lastViewedPostIdRef.current === postId) return;
 		lastViewedPostIdRef.current = postId;
 		setUserViewCountsById((prev) => ({
 			...prev,
 			[postId]: (prev[postId] || 0) + 1,
 		}));
-	}).current;
+		// ADS (disabled):
+		// setAdScoreCount((prev) => {
+		// 	let increment = 1;
+		// 	if (!adSeenIdsRef.current.has(postId)) {
+		// 		adSeenIdsRef.current.add(postId);
+		// 		increment += 1;
+		// 	}
+		// 	const next = prev + increment;
+		// 	if (next >= AD_TRIGGER_SCORE) {
+		// 		showInterstitialAd();
+		// 		return next - AD_TRIGGER_SCORE;
+		// 	}
+		// 	return next;
+		// });
+		void persistViewById(postId);
+	}, [persistViewById]);
 
 	// Comments sheet state.
 	const [commentsOpen, setCommentsOpen] = useState(false);
@@ -1282,126 +1926,365 @@ export default function App() {
 		setTimeout(() => setCommentsPostId(null), 220);
 	}, []);
 
+	const handleDeleteVideo = useCallback(
+		async (postId) => {
+			if (!postId || isDeletingVideo) return;
+			setIsDeletingVideo(true);
+			try {
+				const response = await apiFetch(`/feed/${encodeURIComponent(postId)}`, {
+					method: "DELETE",
+				});
+				const body = await response.json().catch(() => ({}));
+				if (!response.ok) {
+					throw new Error(body?.error || `Delete failed (${response.status})`);
+				}
+
+				setFeed((prev) => prev.filter((p) => p.id !== postId));
+				if (commentsPostId === postId) {
+					setCommentsOpen(false);
+					setCommentsPostId(null);
+				}
+			} catch (error) {
+				console.warn("Failed to delete video:", error);
+				setFeedError(error?.message || "Failed to delete video.");
+			} finally {
+				setIsDeletingVideo(false);
+			}
+		},
+		[apiFetch, commentsPostId, isDeletingVideo]
+	);
+
+	const handleDeleteChannel = useCallback(
+		async (username) => {
+			const target = String(username || "").trim();
+			if (!target || isDeletingChannel) return;
+			setIsDeletingChannel(true);
+			try {
+				const response = await apiFetch(
+					`/channels/${encodeURIComponent(target)}`,
+					{ method: "DELETE" }
+				);
+				const body = await response.json().catch(() => ({}));
+				if (!response.ok) {
+					throw new Error(body?.error || `Delete channel failed (${response.status})`);
+				}
+				setFeed((prev) => prev.filter((p) => p.username !== target));
+				setCommentsOpen(false);
+				setCommentsPostId(null);
+			} catch (error) {
+				console.warn("Failed to delete channel:", error);
+				setFeedError(error?.message || "Failed to delete channel.");
+			} finally {
+				setIsDeletingChannel(false);
+			}
+		},
+		[apiFetch, isDeletingChannel]
+	);
+
+	const openUserProfile = useCallback(
+		(username) => {
+			const target = String(username || "").trim();
+			if (!target) return;
+			lastFeedEntryRef.current = "manual";
+			setPendingFeedIndex(null);
+			setPendingFeedPostId(null);
+			setIsFollowingListOpen(false);
+			setSelectedProfileUsername(target);
+			setFeedFilter("all");
+			setSearchQuery("");
+			setIsSearchOpen(false);
+			pagerRef.current?.scrollToIndex({ index: 1, animated: true });
+		},
+		[]
+	);
+
 	// Resolve the post shown in the comments sheet.
 	const activeCommentsPost = useMemo(() => {
 		return feed.find((p) => p.id === commentsPostId) ?? null;
 	}, [feed, commentsPostId]);
 
-	// Append a new comment to the active post.
+	// Append a new comment by persisting to backend first.
 	const addCommentToActivePost = useCallback(
-		(text) => {
+		async (text) => {
 			if (!commentsPostId) return;
+			const trimmed = String(text || "").trim();
+			if (!trimmed) return;
 
-			setFeed((prev) =>
-				prev.map((p) => {
-					if (p.id !== commentsPostId) return p;
+			try {
+				const response = await apiFetch(
+					`/feed/${encodeURIComponent(commentsPostId)}/comments`,
+					{
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ text: trimmed }),
+					}
+				);
+				const body = await response.json().catch(() => ({}));
+				if (!response.ok) {
+					throw new Error(body?.error || `Comment failed (${response.status})`);
+				}
+				const persistedComment = body?.comment;
+				const persistedCount = Number(body?.commentsCount);
+				if (!persistedComment) {
+					throw new Error("Comment API did not return comment payload.");
+				}
 
-					const newComment = {
-						id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-						user: "andrew", // TODO: replace with current user
-						text,
-						likes: 0,
-						createdAt: new Date().toISOString(),
-					};
-
-					const nextComments = [newComment, ...(p.comments ?? [])];
-
-					return {
-						...p,
-						comments: nextComments,
-						commentsCount: (p.commentsCount ?? p.comments?.length ?? 0) + 1,
-					};
-				})
-			);
-			setUserCommentCountsById((prev) => ({
-				...prev,
-				[commentsPostId]: (prev[commentsPostId] || 0) + 1,
-			}));
+				setFeed((prev) =>
+					prev.map((p) => {
+						if (p.id !== commentsPostId) return p;
+						const nextComments = [persistedComment, ...(p.comments ?? [])];
+						return {
+							...p,
+							comments: nextComments,
+							commentsCount: Number.isFinite(persistedCount)
+								? persistedCount
+								: (p.commentsCount ?? p.comments?.length ?? 0) + 1,
+						};
+					})
+				);
+				setUserCommentCountsById((prev) => ({
+					...prev,
+					[commentsPostId]: (prev[commentsPostId] || 0) + 1,
+				}));
+			} catch (error) {
+				console.warn("Failed to persist comment:", error);
+			}
 		},
-		[commentsPostId, setFeed]
+		[apiFetch, commentsPostId, setFeed]
 	);
 
 	const candidateFeed = useMemo(() => {
-		const baseFeed =
+		const rawBaseFeed =
 			feedFilter === "user"
-				? feed.filter((post) => post.username === currentUser)
+				? feed.filter(
+						(post) => post.username === (selectedProfileUsername || currentUser)
+					)
 				: feed.filter((post) => post.username !== currentUser);
+		const baseFeed =
+			feedFilter === "user" ? sortByCreatedAtDesc(rawBaseFeed) : rawBaseFeed;
 		return getSearchMatchesInOrder(baseFeed, searchQuery);
-	}, [feed, feedFilter, searchQuery, currentUser]);
+	}, [feed, feedFilter, searchQuery, currentUser, selectedProfileUsername]);
 	const candidateIdsKey = useMemo(
 		() => candidateFeed.map((post) => post.id).join("|"),
 		[candidateFeed]
 	);
 
 	const [recommendedIds, setRecommendedIds] = useState([]);
+	const recommendationResult = useMemo(() => {
+		if (feedFilter === "user") {
+			return {
+				rankedIds: candidateFeed.map((post) => post.id),
+				evaluation: null,
+			};
+		}
 
-	const pickNextRecommendedId = (excludedIds) => {
-		if (!candidateFeed.length) return null;
-		const excluded = new Set(excludedIds);
-		const ranked = rankFeedItems({
+		const stage1Candidates = generateStage1Candidates({
 			items: candidateFeed,
 			followedUsers: followedUsersRef.current,
 			userCommentCountsById,
 			userViewCountsById,
+			maxCandidates: Math.max(20, candidateFeed.length),
 		});
-		const next = ranked.find((post) => !excluded.has(post.id));
-		return next?.id || null;
-	};
+		const stage1ById = Object.fromEntries(
+			stage1Candidates.map((entry) => [entry.post.id, entry])
+		);
+		const rows = buildTrainingRows(stage1Candidates, userViewCountsById);
+		const { train, test } = splitTrainTestRows(rows);
 
-	const ensureRecommendationBuffer = (existingIds, minLength) => {
-		if (!candidateFeed.length) return [];
-		const seen = new Set();
-		const validIds = existingIds.filter((id) => {
-			if (seen.has(id)) return false;
-			seen.add(id);
-			return candidateFeed.some((post) => post.id === id);
-		});
-		const targetLength = Math.min(candidateFeed.length, Math.max(0, minLength));
-		const nextIds = [...validIds];
-		while (nextIds.length < targetLength) {
-			const nextId = pickNextRecommendedId(nextIds);
-			if (!nextId) break;
-			nextIds.push(nextId);
+		const toSamples = (items, includeKeywordFeature) =>
+			items.map((row) => ({
+				postId: row.postId,
+				label: row.label,
+				features: buildModelFeatures({
+					keywordScore: row.entry.keywordScore,
+					similarity: row.entry.similarity,
+					post: row.entry.post,
+					stage1RankIndex: row.stage1RankIndex,
+					followedUsers: followedUsersRef.current,
+					userCommentCountsById,
+					userViewCountsById,
+					includeKeywordFeature,
+				}),
+			}));
+
+		const trainLearned = toSamples(train, false);
+		const trainHybrid = toSamples(train, true);
+		const testLearned = toSamples(test, false);
+		const testHybrid = toSamples(test, true);
+
+		const learnedModel = trainLogisticRegression(
+			trainLearned,
+			trainLearned[0]?.features?.length || 0
+		);
+		const hybridModel = trainLogisticRegression(
+			trainHybrid,
+			trainHybrid[0]?.features?.length || 0
+		);
+
+		const learnedScoresById = {};
+		const hybridScoresById = {};
+		for (const row of testLearned) {
+			learnedScoresById[row.postId] = logisticPredict(
+				learnedModel.weights,
+				row.features
+			);
 		}
-		return nextIds;
-	};
+		for (const row of testHybrid) {
+			hybridScoresById[row.postId] = logisticPredict(
+				hybridModel.weights,
+				row.features
+			);
+		}
+
+		const evaluation = evaluateRecommendationModels({
+			rows: test,
+			stage1ById,
+			learnedScoresById,
+			hybridScoresById,
+		});
+
+		const reranked = stage1Candidates
+			.map((entry, stage1RankIndex) => {
+				const learnedFeatures = buildModelFeatures({
+					keywordScore: entry.keywordScore,
+					similarity: entry.similarity,
+					post: entry.post,
+					stage1RankIndex,
+					followedUsers: followedUsersRef.current,
+					userCommentCountsById,
+					userViewCountsById,
+					includeKeywordFeature: false,
+				});
+				const hybridFeatures = buildModelFeatures({
+					keywordScore: entry.keywordScore,
+					similarity: entry.similarity,
+					post: entry.post,
+					stage1RankIndex,
+					followedUsers: followedUsersRef.current,
+					userCommentCountsById,
+					userViewCountsById,
+					includeKeywordFeature: true,
+				});
+				const learnedProbability = learnedFeatures.length
+					? logisticPredict(learnedModel.weights, learnedFeatures)
+					: 0;
+				const hybridProbability = hybridFeatures.length
+					? logisticPredict(hybridModel.weights, hybridFeatures)
+					: 0;
+
+				return {
+					id: entry.post.id,
+					hasSeen: !!entry.post.hasSeen,
+					stage1Score: entry.keywordScore,
+					learnedProbability,
+					hybridProbability,
+					finalScore: hybridProbability * 0.85 + learnedProbability * 0.15,
+				};
+			})
+			.sort((a, b) => {
+				if (a.hasSeen !== b.hasSeen) return a.hasSeen ? 1 : -1;
+				if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+				return b.stage1Score - a.stage1Score;
+			});
+
+		return {
+			rankedIds: reranked.map((row) => row.id),
+			evaluation,
+		};
+	}, [
+		candidateFeed,
+		feedFilter,
+		followVersion,
+		userCommentCountsById,
+		userViewCountsById,
+	]);
 
 	useEffect(() => {
-		const normalizedSearch = searchQuery.trim().toLowerCase();
-		const searchChanged = normalizedSearch !== lastQueueSearchRef.current;
-		const shouldRebuild = !queueInitializedRef.current || searchChanged;
-		if (!shouldRebuild) return;
-		if (!candidateFeed.length) return;
+		setRecommendedIds((prev) => {
+			const nextRanked = recommendationResult.rankedIds;
+			if (!nextRanked.length) return [];
+			if (feedFilter === "user") return nextRanked;
+			if (!prev.length) return nextRanked;
 
-		setRecommendedIds(
-			ensureRecommendationBuffer([], Math.min(3, candidateFeed.length))
+			const validIds = new Set(nextRanked);
+			const seen = new Set();
+			const freezeCount = Math.min(prev.length, Math.max(0, maxIndex) + 1);
+			const frozenPrefix = [];
+			for (const id of prev.slice(0, freezeCount)) {
+				if (!validIds.has(id) || seen.has(id)) continue;
+				seen.add(id);
+				frozenPrefix.push(id);
+			}
+
+			const tail = [];
+			for (const id of nextRanked) {
+				if (seen.has(id)) continue;
+				seen.add(id);
+				tail.push(id);
+			}
+
+			const merged = [...frozenPrefix, ...tail];
+			const currentVisibleId = currentVisiblePostIdRef.current;
+			if (
+				currentVisibleId &&
+				validIds.has(currentVisibleId) &&
+				merged[Math.max(0, activeIndex)] !== currentVisibleId
+			) {
+				const sourceIdx = merged.indexOf(currentVisibleId);
+				if (sourceIdx >= 0) {
+					const targetIdx = Math.min(
+						Math.max(0, activeIndex),
+						merged.length - 1
+					);
+					const [picked] = merged.splice(sourceIdx, 1);
+					merged.splice(targetIdx, 0, picked);
+				}
+			}
+
+			return merged;
+		});
+	}, [activeIndex, feedFilter, maxIndex, recommendationResult.rankedIds]);
+
+	useEffect(() => {
+		const e = recommendationResult.evaluation;
+		if (!e) return;
+		const signature = JSON.stringify([
+			e.keywordLikeRate,
+			e.learnedLikeRate,
+			e.hybridLikeRate,
+			e.keywordAuc,
+			e.learnedAuc,
+			e.hybridAuc,
+			e.improvementPct,
+		]);
+		if (lastRecommendationSignatureRef.current === signature) return;
+		lastRecommendationSignatureRef.current = signature;
+		const improvementText =
+			e.improvementPct == null ? "n/a" : `${e.improvementPct.toFixed(1)}%`;
+		console.log(
+			`[Recommender Eval] like@${e.k}: keyword=${((e.keywordLikeRate || 0) * 100).toFixed(1)}% learned=${((e.learnedLikeRate || 0) * 100).toFixed(1)}% hybrid=${((e.hybridLikeRate || 0) * 100).toFixed(1)}% | auc: keyword=${(e.keywordAuc || 0).toFixed(3)} learned=${(e.learnedAuc || 0).toFixed(3)} hybrid=${(e.hybridAuc || 0).toFixed(3)} | hybrid improvement=${improvementText}`
 		);
-		setActiveIndex(0);
+	}, [recommendationResult.evaluation]);
+
+	useEffect(() => {
+		if (lastFeedEntryRef.current === "profileVideo") {
+			shouldScrollToTopRef.current = false;
+			return;
+		}
 		shouldScrollToTopRef.current = true;
-		queueInitializedRef.current = true;
-		lastQueueSearchRef.current = normalizedSearch;
-	}, [candidateIdsKey, candidateFeed.length, searchQuery]);
-
-	useEffect(() => {
-		if (!candidateFeed.length) return;
-		setRecommendedIds((prev) =>
-			ensureRecommendationBuffer(
-				prev,
-				Math.min(candidateFeed.length, activeIndex + 3)
-			)
-		);
-	}, [activeIndex, candidateFeed.length, followVersion, userCommentCountsById, userViewCountsById]);
-
-	useEffect(() => {
-		if (!candidateFeed.length) return;
-		setRecommendedIds((prev) =>
-			prev.filter((id) =>
-			candidateFeed.some((post) => post.id === id)
-			)
-		);
-	}, [candidateIdsKey, candidateFeed.length]);
+		setActiveIndex(0);
+		setMaxIndex(0);
+	}, [candidateIdsKey, searchQuery]);
 
 	const filteredFeed = useMemo(() => {
+		if (feedFilter === "user") {
+			const seen = new Set();
+			return candidateFeed.filter((post) => {
+				if (seen.has(post.id)) return false;
+				seen.add(post.id);
+				return true;
+			});
+		}
 		if (!recommendedIds.length) return [];
 		const byId = new Map(candidateFeed.map((post) => [post.id, post]));
 		const ordered = recommendedIds.map((id) => byId.get(id)).filter(Boolean);
@@ -1411,7 +2294,7 @@ export default function App() {
 			seen.add(post.id);
 			return true;
 		});
-	}, [candidateFeed, recommendedIds]);
+	}, [candidateFeed, feedFilter, recommendedIds]);
 
 	useEffect(() => {
 		if (!shouldScrollToTopRef.current) return;
@@ -1434,33 +2317,45 @@ export default function App() {
 		}
 	}, [activeIndex, filteredFeed.length]);
 
-	const userVideos = useMemo(() => {
-		return feed.filter((post) => post.username === currentUser);
-	}, [feed, currentUser]);
+	const viewedProfileUsername = selectedProfileUsername || currentUser;
+	const isOwnProfileView = viewedProfileUsername === currentUser;
+	const profileVideos = useMemo(() => {
+		return sortByCreatedAtDesc(
+			feed.filter((post) => post.username === viewedProfileUsername)
+		);
+	}, [feed, viewedProfileUsername]);
 
-	const handleProfileVideoPress = useCallback((index) => {
+	const handleProfileVideoPress = useCallback((postId) => {
+		const tappedPostId = String(postId || "").trim();
+		if (!tappedPostId) return;
 		lastFeedEntryRef.current = "profileVideo";
-		setPendingFeedIndex(index);
+		setPendingFeedIndex(null);
+		setPendingFeedPostId(tappedPostId);
+		setSelectedProfileUsername(viewedProfileUsername);
 		setFeedFilter("user");
 		setSearchQuery("");
 		setIsSearchOpen(false);
 		pagerRef.current?.scrollToIndex({ index: 0, animated: true });
-		if (Number.isInteger(index)) {
-			setActiveIndex(index);
-		} else {
-			setActiveIndex(0);
-		}
-	}, []);
+		setMaxIndex(0);
+		setActiveIndex(0);
+	}, [viewedProfileUsername]);
 
 	useEffect(() => {
 		if (feedFilter !== "user") return;
 		if (!filteredFeed.length) return;
-		if (pendingFeedIndex == null) return;
+		if (pendingFeedIndex == null && !pendingFeedPostId) return;
 
-		const targetIndex = Math.min(
-			Math.max(0, pendingFeedIndex),
-			filteredFeed.length - 1
-		);
+		let targetIndex = 0;
+		if (pendingFeedPostId) {
+			const foundIndex = filteredFeed.findIndex((post) => post.id === pendingFeedPostId);
+			if (foundIndex >= 0) {
+				targetIndex = foundIndex;
+			} else if (pendingFeedIndex != null) {
+				targetIndex = Math.min(Math.max(0, pendingFeedIndex), filteredFeed.length - 1);
+			}
+		} else if (pendingFeedIndex != null) {
+			targetIndex = Math.min(Math.max(0, pendingFeedIndex), filteredFeed.length - 1);
+		}
 
 		feedListRef.current?.scrollToIndex({
 			index: targetIndex,
@@ -1468,7 +2363,8 @@ export default function App() {
 		});
 		setActiveIndex(targetIndex);
 		setPendingFeedIndex(null);
-	}, [feedFilter, filteredFeed.length, pendingFeedIndex]);
+		setPendingFeedPostId(null);
+	}, [feedFilter, filteredFeed, pendingFeedIndex, pendingFeedPostId]);
 
 	const pages = useMemo(() => [{ key: "feed" }, { key: "profile" }], []);
 	const pagerViewabilityConfig = useMemo(
@@ -1605,6 +2501,7 @@ export default function App() {
 				backgroundColor="transparent"
 				barStyle="light-content"
 			/>
+			{/* ADS (disabled): AdFallbackModal removed until AdMob approval */}
 			<Modal
 				transparent
 				visible={isAivaPromptOpen}
@@ -1691,13 +2588,7 @@ export default function App() {
 							<Text style={styles.aivaErrorText}>{aivaError}</Text>
 						) : null}
 						<View style={styles.aivaModalActions}>
-							<TouchableOpacity
-								onPress={() => setIsAivaPromptOpen(false)}
-								activeOpacity={0.9}
-								style={styles.aivaModalButton}
-							>
-								<Text style={styles.aivaModalButtonText}>Cancel</Text>
-							</TouchableOpacity>
+							{/* ADS (disabled): watch-ad button removed until AdMob approval */}
 							<TouchableOpacity
 								onPress={handleGenerateAiva}
 								activeOpacity={0.9}
@@ -1712,6 +2603,13 @@ export default function App() {
 									{isGeneratingAiva ? "Generating..." : "Generate"}
 								</Text>
 							</TouchableOpacity>
+							<TouchableOpacity
+								onPress={() => setIsAivaPromptOpen(false)}
+								activeOpacity={0.9}
+								style={styles.aivaModalButton}
+							>
+								<Text style={styles.aivaModalButtonText}>Cancel</Text>
+							</TouchableOpacity>
 						</View>
 					</View>
 				</View>
@@ -1723,11 +2621,29 @@ export default function App() {
 				onRequestClose={() => setIsSettingsOpen(false)}
 			>
 				<View style={styles.aivaModalBackdrop}>
-					<View style={styles.aivaModalCard}>
-						<Text style={styles.aivaModalTitle}>Settings</Text>
-						<Text style={styles.aivaModalLabel}>Change phone number</Text>
-						<TextInput
-							value={settingsNewPhone}
+						<View style={styles.aivaModalCard}>
+							<Text style={styles.aivaModalTitle}>Settings</Text>
+							<Text style={styles.aivaModalLabel}>Profile photo</Text>
+							<View style={styles.aivaModalActions}>
+								<TouchableOpacity
+									onPress={handlePickProfilePhoto}
+									disabled={settingsBusy}
+									activeOpacity={0.9}
+									style={[
+										styles.aivaModalButton,
+										styles.aivaModalButtonPrimary,
+										settingsBusy && styles.aivaModalButtonDisabled,
+									]}
+								>
+									<Text style={styles.aivaModalButtonText}>
+										{settingsBusy ? "Uploading..." : "Upload Profile Photo"}
+									</Text>
+								</TouchableOpacity>
+							</View>
+
+							<Text style={styles.aivaModalLabel}>Change phone number</Text>
+							<TextInput
+								value={settingsNewPhone}
 							onChangeText={setSettingsNewPhone}
 							placeholder="+15551234567"
 							placeholderTextColor="rgba(255,255,255,0.5)"
@@ -1830,6 +2746,49 @@ export default function App() {
 					</View>
 				</View>
 			</Modal>
+			<Modal
+				transparent
+				visible={isFollowingListOpen}
+				animationType="fade"
+				onRequestClose={() => setIsFollowingListOpen(false)}
+			>
+				<View style={styles.aivaModalBackdrop}>
+					<View style={styles.aivaModalCard}>
+						<Text style={styles.aivaModalTitle}>Following</Text>
+						{followedUsernames.length === 0 ? (
+							<Text style={styles.followedListEmpty}>
+								You are not following anyone yet.
+							</Text>
+						) : (
+							<FlatList
+								data={followedUsernames}
+								keyExtractor={(username) => username}
+								renderItem={({ item: username }) => (
+									<TouchableOpacity
+										onPress={() => openUserProfile(username)}
+										activeOpacity={0.9}
+										style={styles.followedListItem}
+									>
+										<Text style={styles.followedListText}>@{username}</Text>
+									</TouchableOpacity>
+								)}
+								style={styles.followedList}
+								contentContainerStyle={styles.followedListContent}
+								showsVerticalScrollIndicator={false}
+							/>
+						)}
+						<View style={styles.aivaModalActions}>
+							<TouchableOpacity
+								onPress={() => setIsFollowingListOpen(false)}
+								activeOpacity={0.9}
+								style={styles.aivaModalButton}
+							>
+								<Text style={styles.aivaModalButtonText}>Close</Text>
+							</TouchableOpacity>
+						</View>
+					</View>
+				</View>
+			</Modal>
 			{isAivaWaiting ? (
 				<View style={styles.aivaLoadingOverlay} pointerEvents="none">
 					<View style={styles.aivaLoadingCard}>
@@ -1863,29 +2822,49 @@ export default function App() {
 						return (
 							<View style={styles.profilePage}>
 								<View style={styles.profileTopRow}>
-									<Text style={styles.profileTitle}>Profile</Text>
+									<Text style={styles.profileTitle}>
+										{isOwnProfileView ? "Profile" : `@${viewedProfileUsername}`}
+									</Text>
 									<View style={styles.profileTopActions}>
-										<TouchableOpacity
-											onPress={() => {
-												setAivaError(null);
-												setIsAivaPromptOpen(true);
-											}}
-											hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-											style={styles.aivaSettingsButton}
-										>
-											<Text style={styles.aivaSettingsIcon}>✨</Text>
-										</TouchableOpacity>
-										<TouchableOpacity
-											onPress={() => {
-												setSettingsError(null);
-												setSettingsInfo("");
-												setIsSettingsOpen(true);
-											}}
-											hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-											style={styles.settingsButton}
-										>
-											<Text style={styles.settingsIcon}>⚙</Text>
-										</TouchableOpacity>
+										{isOwnProfileView ? (
+											<>
+												<Text style={styles.aivaTopVideosLeftText}>
+													{aivaVideosLeft} left
+												</Text>
+												<TouchableOpacity
+													onPress={() => {
+														setAivaError(null);
+														void loadAivaStatus();
+														setIsAivaPromptOpen(true);
+													}}
+													hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+													style={styles.aivaSettingsButton}
+												>
+													<Text style={styles.aivaSettingsIcon}>✨</Text>
+												</TouchableOpacity>
+												<TouchableOpacity
+													onPress={() => {
+														setSettingsError(null);
+														setSettingsInfo("");
+														setIsSettingsOpen(true);
+													}}
+													hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+													style={styles.settingsButton}
+												>
+													<Text style={styles.settingsIcon}>⚙</Text>
+												</TouchableOpacity>
+											</>
+										) : (
+											<TouchableOpacity
+												onPress={() => {
+													setSelectedProfileUsername(currentUser);
+												}}
+												hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+												style={styles.settingsButton}
+											>
+												<Text style={styles.settingsIcon}>←</Text>
+											</TouchableOpacity>
+										)}
 									</View>
 								</View>
 								<View style={styles.profileHeader}>
@@ -1894,9 +2873,9 @@ export default function App() {
 										activeOpacity={0.9}
 										style={styles.profileAvatar}
 									>
-										{currentUserProfilePicture ? (
+										{displayedProfilePicture ? (
 											<Image
-												source={{ uri: currentUserProfilePicture }}
+												source={{ uri: displayedProfilePicture }}
 												style={styles.profileAvatarImage}
 											/>
 										) : (
@@ -1905,8 +2884,8 @@ export default function App() {
 											</Text>
 										)}
 									</TouchableOpacity>
-									<Text style={styles.profileUsername}>@{currentUser}</Text>
-									{currentUser === "andrew" ? (
+									<Text style={styles.profileUsername}>@{viewedProfileUsername}</Text>
+									{isOwnProfileView && currentUser.toLowerCase() === "andrewr" ? (
 										<TouchableOpacity
 											onPress={handleResetUploadCount}
 											disabled={isResettingUploads}
@@ -1927,7 +2906,7 @@ export default function App() {
 								<View style={styles.profileStats}>
 									<View style={styles.profileStat}>
 										<Text style={styles.profileStatValue}>
-											{userVideos.length}
+											{profileVideos.length}
 										</Text>
 										<Text style={styles.profileStatLabel}>Videos</Text>
 									</View>
@@ -1935,21 +2914,34 @@ export default function App() {
 										<Text style={styles.profileStatValue}>0</Text>
 										<Text style={styles.profileStatLabel}>Followers</Text>
 									</View>
-									<View style={styles.profileStat}>
-										<Text style={styles.profileStatValue}>0</Text>
+									<TouchableOpacity
+										onPress={() => {
+											if (!isOwnProfileView) return;
+											setIsFollowingListOpen(true);
+										}}
+										activeOpacity={0.85}
+										disabled={!isOwnProfileView}
+										style={[
+											styles.profileStat,
+											isOwnProfileView && styles.profileStatButton,
+										]}
+									>
+										<Text style={styles.profileStatValue}>
+											{isOwnProfileView ? followedUsernames.length : 0}
+										</Text>
 										<Text style={styles.profileStatLabel}>Following</Text>
-									</View>
+									</TouchableOpacity>
 								</View>
 								<View style={styles.profileTabRow}>
 									<Text style={styles.profileTabActive}>Videos</Text>
 								</View>
 									<FlatList
-										data={userVideos}
+										data={profileVideos}
 										keyExtractor={(video) => video.id}
 										numColumns={3}
-										renderItem={({ item: video, index }) => (
+										renderItem={({ item: video }) => (
 											<TouchableOpacity
-												onPress={() => handleProfileVideoPress(index)}
+												onPress={() => handleProfileVideoPress(video.id)}
 												activeOpacity={0.9}
 												style={styles.profileVideoTile}
 											>
@@ -2007,6 +2999,7 @@ export default function App() {
 									onPress={() => {
 										lastFeedEntryRef.current = "manual";
 										setPendingFeedIndex(null);
+										setSelectedProfileUsername(currentUser);
 										setFeedFilter("all");
 										setSearchQuery("");
 										setIsSearchOpen(false);
@@ -2040,10 +3033,14 @@ export default function App() {
 										onToggleLike={toggleLikeById}
 										onOpenComments={openCommentsFor}
 										onToggleFollow={toggleFollowByUsername}
+										onOpenUserProfile={openUserProfile}
+										onDeleteVideo={handleDeleteVideo}
+										onDeleteChannel={handleDeleteChannel}
 										followedUsersRef={followedUsersRef}
 										currentUser={currentUser}
 									/>
 								)}
+								extraData={followVersion}
 								pagingEnabled
 								showsVerticalScrollIndicator={false}
 								onViewableItemsChanged={onViewableItemsChanged}
@@ -2165,6 +3162,59 @@ const styles = StyleSheet.create({
 		marginTop: 12,
 	},
 	container: { flex: 1, backgroundColor: "black" },
+	adBackdrop: {
+		flex: 1,
+		backgroundColor: "rgba(0,0,0,0.72)",
+		alignItems: "center",
+		justifyContent: "center",
+		paddingHorizontal: 20,
+	},
+	adCard: {
+		width: "100%",
+		maxWidth: 420,
+		borderRadius: 16,
+		padding: 18,
+		backgroundColor: "#0f1118",
+		borderWidth: 1,
+		borderColor: "rgba(255,255,255,0.16)",
+	},
+	adBadge: {
+		alignSelf: "flex-start",
+		color: "#d7e2ff",
+		backgroundColor: "rgba(47,131,255,0.22)",
+		paddingHorizontal: 10,
+		paddingVertical: 4,
+		borderRadius: 999,
+		fontWeight: "700",
+		fontSize: 12,
+		marginBottom: 10,
+	},
+	adTitle: {
+		color: "white",
+		fontSize: 22,
+		fontWeight: "800",
+	},
+	adText: {
+		color: "rgba(255,255,255,0.88)",
+		marginTop: 8,
+		lineHeight: 20,
+	},
+	adMeta: {
+		color: "rgba(255,255,255,0.62)",
+		marginTop: 8,
+		fontSize: 12,
+	},
+	adCloseButton: {
+		marginTop: 16,
+		paddingVertical: 12,
+		borderRadius: 10,
+		alignItems: "center",
+		backgroundColor: "#2f83ff",
+	},
+	adCloseButtonText: {
+		color: "white",
+		fontWeight: "700",
+	},
 	feedPage: { width: W, height: H, backgroundColor: "black" },
 	profilePage: { width: W, height: H, backgroundColor: "black" },
 	page: { height: H, width: W, backgroundColor: "black" },
@@ -2195,9 +3245,42 @@ const styles = StyleSheet.create({
 		alignItems: "center",
 		gap: 10,
 	},
+	usernameButton: {
+		paddingVertical: 2,
+	},
 	username: { color: "white", fontWeight: "800", fontSize: 16 },
 	caption: { color: "white", marginTop: 6 },
 	audio: { color: "rgba(255,255,255,0.8)", marginTop: 4 },
+	deleteVideoButton: {
+		marginTop: 10,
+		alignSelf: "flex-start",
+		paddingHorizontal: 10,
+		paddingVertical: 6,
+		borderRadius: 999,
+		backgroundColor: "rgba(255,80,80,0.25)",
+		borderWidth: 1,
+		borderColor: "rgba(255,80,80,0.6)",
+	},
+	deleteVideoButtonText: {
+		color: "white",
+		fontSize: 12,
+		fontWeight: "700",
+	},
+	deleteChannelButton: {
+		marginTop: 8,
+		alignSelf: "flex-start",
+		paddingHorizontal: 10,
+		paddingVertical: 6,
+		borderRadius: 999,
+		backgroundColor: "rgba(255,40,40,0.25)",
+		borderWidth: 1,
+		borderColor: "rgba(255,40,40,0.7)",
+	},
+	deleteChannelButtonText: {
+		color: "white",
+		fontSize: 12,
+		fontWeight: "700",
+	},
 	followButton: {
 		paddingHorizontal: 12,
 		paddingVertical: 6,
@@ -2458,6 +3541,7 @@ const styles = StyleSheet.create({
 	},
 	aivaModalActions: {
 		flexDirection: "row",
+		alignItems: "center",
 		justifyContent: "flex-end",
 		gap: 10,
 	},
@@ -2470,6 +3554,12 @@ const styles = StyleSheet.create({
 	aivaModalButtonPrimary: {
 		backgroundColor: "#2f83ff",
 	},
+	// ADS (disabled):
+	// aivaRewardAdButton: {
+	// 	backgroundColor: "rgba(255,179,71,0.22)",
+	// 	borderWidth: 1,
+	// 	borderColor: "rgba(255,179,71,0.55)",
+	// },
 	settingsLogoutButton: {
 		marginTop: 10,
 		alignSelf: "stretch",
@@ -2527,6 +3617,31 @@ const styles = StyleSheet.create({
 		fontSize: 12,
 		marginTop: 8,
 		textAlign: "right",
+	},
+	followedList: {
+		maxHeight: 280,
+		marginBottom: 8,
+	},
+	followedListContent: {
+		paddingBottom: 4,
+	},
+	followedListItem: {
+		paddingHorizontal: 12,
+		paddingVertical: 12,
+		borderRadius: 10,
+		backgroundColor: "rgba(255,255,255,0.08)",
+		borderWidth: 1,
+		borderColor: "rgba(255,255,255,0.12)",
+		marginBottom: 8,
+	},
+	followedListText: {
+		color: "white",
+		fontSize: 14,
+		fontWeight: "600",
+	},
+	followedListEmpty: {
+		color: "rgba(255,255,255,0.68)",
+		marginBottom: 12,
 	},
 
 	searchClose: {
@@ -2604,6 +3719,11 @@ const styles = StyleSheet.create({
 		color: "white",
 		fontSize: 16,
 	},
+	aivaTopVideosLeftText: {
+		color: "rgba(255,255,255,0.8)",
+		fontSize: 12,
+		fontWeight: "600",
+	},
 	profileHeader: {
 		marginTop: 24,
 		alignItems: "center",
@@ -2657,6 +3777,11 @@ const styles = StyleSheet.create({
 	},
 	profileStat: {
 		alignItems: "center",
+	},
+	profileStatButton: {
+		paddingHorizontal: 8,
+		paddingVertical: 4,
+		borderRadius: 10,
 	},
 	profileStatValue: {
 		color: "white",
